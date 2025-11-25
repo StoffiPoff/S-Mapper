@@ -19,7 +19,7 @@ a = Analysis(
     ['s_mapper.py'],
     pathex=[],
     binaries=[],
-    datas=[('S-Mapper-logo - 256.png', '.')],
+    datas=[('icon.png', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -48,7 +48,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='S-Mapper-logo - 256.png',
+    icon='icon.png',
     version_info={
         'string': {
             'CompanyName': metadata.get('__company__'),

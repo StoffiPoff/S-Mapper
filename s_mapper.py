@@ -149,7 +149,7 @@ class KeyMapperApp(QWidget):
 
     def initUI(self):
         self.setWindowTitle("S-Mapper")
-        self.setWindowIcon(QIcon(resource_path('S-Mapper-logo - 256.png')))
+        self.setWindowIcon(QIcon(resource_path('icon.png')))
         self.setGeometry(100, 100, 800, 800)
 
         # Dark mode stylesheet
@@ -329,7 +329,7 @@ class KeyMapperApp(QWidget):
 
         # --- System Tray Icon ---
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(QIcon(resource_path('S-Mapper-logo - 256.png')))
+        self.tray_icon.setIcon(QIcon(resource_path('icon.png')))
         self.tray_icon.setToolTip("S-Mapper App")
 
         tray_menu = QMenu()
