@@ -12,11 +12,11 @@ def get_metadata(script_path):
                 metadata[key] = match.group(1)
     return metadata
 
-script_name = 'key_mapper_app_qt.py'
+script_name = 's_mapper.py'
 metadata = get_metadata(script_name)
 
 a = Analysis(
-    ['key_mapper_app_qt.py'],
+    ['s_mapper.py'],
     pathex=[],
     binaries=[],
     datas=[('S-Mapper-logo - 256.png', '.')],
