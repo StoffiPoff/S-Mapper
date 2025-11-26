@@ -1,22 +1,50 @@
-# Ignore the old application files
+# ===============================
+# --- Build & Distribution ---
+# ===============================
+# Ignore PyInstaller output
+/build/
+/dist/
+*.spec
+
+# Ignore Inno Setup output
+/installer/
+/s_mapper_setup.iss
+
+# ===============================
+# --- Python Cache & Deps ---
+# ===============================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore local Python environment
+/python311/
+
+# ===============================
+# --- User & Old Files ---
+# ===============================
+# Ignore user-specific configuration
+mappings.ini
+
+# Ignore old application files
 key_mapper_app.py
 key_mapper_app.exe
 open-key-mapper-app.bat
 
-# Ignore Python virtual environment
-python311/
-
-# Ignore PyInstaller build artifacts and cache
-dist/
-build/
-_internal/
-*.pyc
-__pycache__/
-
-# Ignore common editor and OS files
+# ===============================
+# --- OS & Editor Specific ---
+# ===============================
+# Visual Studio Code
 .vscode/
+
+# JetBrains
 .idea/
+
+# macOS
+.DS_Store
+
+# Other
 *.swp
 *.swo
 *~
-.DS_Store
