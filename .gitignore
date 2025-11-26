@@ -48,3 +48,5 @@ open-key-mapper-app.bat
 *.swp
 *.swo
 *~
+microsoft.*
+_internal*
