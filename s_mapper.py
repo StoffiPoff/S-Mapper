@@ -6,24 +6,67 @@ import re
 import subprocess
 
 # Properties for the executable
-__company__ = "Stoffi Software Solutions"
-__product__ = "S-Mapper"
+__company__ = "JafsWorks"
+__product__ = "Stoffi-S-Mapper"
 __version__ = "1.0.0"
 __description__ = "A versatile tool for remapping keyboard and mouse inputs."
-__copyright__ = "Copyright (c) 2025 Stoffi Software Solutions"
+__copyright__ = "Copyright (c) 2025 JafsWorks"
 __license__ = "MIT"
-__internal_name__ = "s-mapper-app"
+__internal_name__ = "stoffi-s-mapper"
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
     QLineEdit, QPushButton, QListWidget, QRadioButton, QFrame, QMessageBox,
-    QSystemTrayIcon, QMenu, QStyle
+    QSystemTrayIcon, QMenu, QDoubleSpinBox, QScrollArea
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QMutex, QMutexLocker, QTimer, QEvent
 from PyQt6.QtGui import QCursor, QIcon, QAction
 from pynput import mouse, keyboard
+import threading
 import pygetwindow as gw
 from pynput.keyboard import Key
+
+# Optional low-level keyboard interception via the 'keyboard' package.
+# We import lazily and safely since the user may not have it installed.
+try:
+    import keyboard as kbd  # type: ignore
+    _KBD_AVAILABLE = True
+except Exception:
+    kbd = None
+    _KBD_AVAILABLE = False
+
+
+def _check_admin_windows() -> bool:
+    """Return True if the current process is running elevated (Windows).
+
+    This uses ctypes.windll.shell32.IsUserAnAdmin which returns a non-zero
+    value when running elevated. Wrap in try/except to avoid import-time
+    errors in environments where ctypes/win32 APIs are restricted.
+    """
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _check_admin_unix() -> bool:
+    """Return True if the current process is running as root on UNIX-like OSes."""
+    try:
+        return os.geteuid() == 0
+    except Exception:
+        return False
+
+
+def is_running_as_admin() -> bool:
+    """Cross-platform check whether the current process is elevated/privileged.
+
+    Returns True on Windows when running elevated, and True on Unix when
+    running as root. Fails safe and returns False on unexpected errors.
+    """
+    if os.name == 'nt':
+        return _check_admin_windows()
+    return _check_admin_unix()
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -31,7 +74,10 @@ def resource_path(relative_path):
         # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
-        base_path = os.path.abspath(".")
+        # Fall back to the directory containing this file which is the
+        # correct resource location during development (avoids relying
+        # on the current working directory which can vary).
+        base_path = os.path.abspath(os.path.dirname(__file__))
 
     return os.path.join(base_path, relative_path)
 
@@ -133,6 +179,11 @@ class PingThread(QThread):
             self.ping_result.emit('red')
 
 class KeyMapperApp(QWidget):
+    # Signal used to run mapping actions on the main (GUI) thread. Emitting
+    # this from the listener thread queues the action onto the Qt event loop
+    # where the single shared keyboard Controller owned by the app will
+    # perform the key presses reliably.
+    mapping_action_signal = pyqtSignal(object)
     def __init__(self):
         super().__init__()
         self.ping_status_label = PingStatusLabel()
@@ -141,11 +192,42 @@ class KeyMapperApp(QWidget):
         self.mappings = {}
         self.mapping_ids = []
         self.mapping_counter = 1
-        self.last_click_time = None
+        self.last_click_time = {}
         self.click_counts = {}
+        # How long between clicks counts as a separate sequence (seconds)
+        # Defaults to 0.6s (configurable via UI)
+        self.click_interval = 0.6
+        # Optional in-memory guards for synthetic key events and low-level hooks
+        # (_kbd_available reflects whether the optional 'keyboard' package
+        # is available on the system).
+        self._ignore_keys = {}
+        self._kbd_available = _KBD_AVAILABLE
+        self._keyboard_hooks = {}  # map source_key -> handler from 'keyboard' package
+        self._kbd_ignore = {}
+        # fast lookup table: source_key -> list of mapping details
+        # (window_title, target_key) to avoid iterating full mapping set
+        # on every key event.
+        self._source_index = {}
+        # runtime flag: low-level keyboard suppression enabled at startup
+        # only available when keyboard package is installed
+        self._kbd_enabled = bool(self._kbd_available)
         self.initUI()
         self.load_mappings_from_config()
+        # Connect mapping action signal -> handler which runs on main thread
+        self.mapping_action_signal.connect(self._handle_mapping_action)
         self.start_listeners()
+
+        # Cache of active window title to avoid expensive per-key calls to
+        # pygetwindow in tight keyboard hook loops. Updated periodically on
+        # the GUI thread; keyboard hook reads it under a simple lock.
+        self._cached_active_title = ""
+        self._active_title_lock = threading.Lock()
+        # Start a short QTimer that updates the cached active window title.
+        # 100ms is a good balance between freshness and overhead.
+        self._active_title_timer = QTimer(self)
+        self._active_title_timer.setInterval(100)
+        self._active_title_timer.timeout.connect(self._update_cached_active_title)
+        self._active_title_timer.start()
 
     def initUI(self):
         self.setWindowTitle("S-Mapper")
@@ -158,6 +240,9 @@ class KeyMapperApp(QWidget):
                 background-color: #1e1e1e;
                 color: #d4d4d4;
                 font-size: 10pt;
+            }
+            QScrollArea {
+                border: none;
             }
             QComboBox {
                 background-color: #252526;
@@ -201,8 +286,22 @@ class KeyMapperApp(QWidget):
             }
         """)
 
-        layout = QVBoxLayout()
-        self.setLayout(layout)
+        # Main layout for the entire window
+        main_layout = QVBoxLayout(self)
+        self.setLayout(main_layout)
+
+        # Scroll area to contain the main content
+        scroll_area = QScrollArea(self)
+        scroll_area.setWidgetResizable(True)
+        main_layout.addWidget(scroll_area)
+
+        # Container widget for the scroll area's content
+        scroll_content = QWidget()
+        scroll_area.setWidget(scroll_content)
+
+        # This is the layout that will hold all your UI components
+        layout = QVBoxLayout(scroll_content)
+        scroll_content.setLayout(layout)
 
         # --- UI Components ---
 
@@ -218,6 +317,19 @@ class KeyMapperApp(QWidget):
         layout.addWidget(QLabel("Number of Presses:"))
         self.press_count_entry = QLineEdit()
         layout.addWidget(self.press_count_entry)
+
+        # Click interval (double spin) — lets the user tune how fast clicks
+        # must occur to be considered a multi-press mapping.
+        interval_frame = QHBoxLayout()
+        interval_frame.addWidget(QLabel("Double-click window (sec):"))
+        self.click_interval_spinbox = QDoubleSpinBox()
+        self.click_interval_spinbox.setRange(0.05, 5.0)
+        self.click_interval_spinbox.setSingleStep(0.05)
+        self.click_interval_spinbox.setDecimals(2)
+        self.click_interval_spinbox.setValue(self.click_interval)
+        self.click_interval_spinbox.setToolTip("Maximum time between consecutive clicks for them to count as one mapping (seconds)")
+        interval_frame.addWidget(self.click_interval_spinbox)
+        layout.addLayout(interval_frame)
 
         # Source Key
         self.source_key_label = QLabel("Source Keyboard Key:")
@@ -308,6 +420,54 @@ class KeyMapperApp(QWidget):
         self.ip_monitor_toggle_button.setCheckable(True)
         ip_monitor_layout.addWidget(self.ip_monitor_toggle_button)
 
+        # A small UI toggle to enable/disable the optional low-level
+        # keyboard suppression. Only shown when the 'keyboard' package
+        # is present in the environment.
+        try:
+            from PyQt6.QtWidgets import QCheckBox
+            # Add a status label that explains whether the optional low-level
+            # suppression is available (keyboard package bundled) and whether
+            # the process has the elevated privileges required to perform
+            # global low-level hooks reliably.
+            self._is_admin = is_running_as_admin()
+            self.kbd_status_label = QLabel()
+
+            if self._kbd_available:
+                # Only show the toggle when the package is installed. If the
+                # app is not elevated, show the checkbox disabled with an
+                # explanation so the user knows to use the elevated build.
+                self.kbd_suppression_checkbox = QCheckBox("Enable low-level suppression (keyboard package)")
+                self.kbd_suppression_checkbox.setChecked(self._kbd_enabled)
+                self.kbd_suppression_checkbox.toggled.connect(self._on_kbd_suppression_toggled)
+
+                if not self._is_admin:
+                    # Allow toggling the checkbox even when not elevated. Some
+                    # systems can still install hooks without admin; the enable
+                    # attempt will validate at runtime and present a friendly
+                    # warning on failure. Provide a tooltip explaining the
+                    # potential limitation rather than disabling the UI.
+                    self.kbd_status_label.setText("Low-level suppression available — app not elevated. Enabling may still work but could require administrator privileges.")
+                    self.kbd_status_label.setStyleSheet('color: #f39c12;')
+                    self.kbd_suppression_checkbox.setToolTip("May require elevated privileges to fully work on some systems; enabling will attempt to install hooks and will warn on failure.")
+                else:
+                    self.kbd_status_label.setText("Low-level suppression available — running elevated.")
+                    self.kbd_status_label.setStyleSheet('color: #8bc34a;')
+
+                ip_monitor_layout.addWidget(self.kbd_suppression_checkbox)
+                ip_monitor_layout.addWidget(self.kbd_status_label)
+
+            else:
+                # keyboard package not present; show a helpful message and
+                # keep the checkbox reference None for backwards compatibility.
+                self.kbd_suppression_checkbox = None
+                self.kbd_status_label.setText("Low-level suppression unavailable — 'keyboard' package not bundled. Use the 'full' build to enable.")
+                self.kbd_status_label.setStyleSheet('color: #e74c3c;')
+                ip_monitor_layout.addWidget(self.kbd_status_label)
+        except Exception:
+            # If for some reason QCheckBox isn't available, fall back
+            # to not showing the toggle.
+            self.kbd_suppression_checkbox = None
+
         layout.addWidget(ip_monitor_frame)
         
         # --- Connections ---
@@ -319,6 +479,7 @@ class KeyMapperApp(QWidget):
         self.source_keyboard_combobox.currentTextChanged.connect(self.on_combobox_selected)
         self.window_selection_radio1.toggled.connect(self.update_window_selection_visibility)
         self.ip_monitor_toggle_button.toggled.connect(self.toggle_ip_monitoring)
+        self.click_interval_spinbox.valueChanged.connect(self._on_interval_changed)
         
         # Clipboard monitoring setup
         self.clipboard = QApplication.clipboard()
@@ -352,11 +513,43 @@ class KeyMapperApp(QWidget):
         self.keyboard_thread.start()
         self.mouse_thread = MouseListenerThread(self)
         self.mouse_thread.start()
+        # If keyboard package-based low-level suppression is available,
+        # ensure handlers are registered now (best-effort).
+        if self._kbd_available and getattr(self, '_kbd_enabled', False):
+            try:
+                self._refresh_keyboard_hooks()
+            except Exception:
+                pass
 
     def update_label_position(self, x, y):
         if self.ping_status_label.isVisible():
             # Position it above the cursor, slightly to the right
             self.ping_status_label.move(x + 10, y - self.ping_status_label.height())
+
+    def _update_cached_active_title(self):
+        """Periodically run on the GUI thread to update the cached active
+        window title. The keyboard hook reads the cached value under a lock
+        to minimize expensive calls to pygetwindow in the handler path.
+        """
+        try:
+            w = gw.getActiveWindow()
+            title = w.title if (w and w.title) else ""
+        except Exception:
+            title = ""
+
+        # store a lower-cased title to simplify case-insensitive matching
+        tnorm = title.strip().lower()
+        # Detect changes so we only refresh hooks when the active window actually changed
+        with self._active_title_lock:
+            old = self._cached_active_title
+            self._cached_active_title = tnorm
+
+        if tnorm != old and self._kbd_available and getattr(self, '_kbd_enabled', False):
+            try:
+                # Update keyboard hooks for the new active title
+                self._update_hooks_for_active_title(tnorm)
+            except Exception:
+                pass
 
     def toggle_ip_monitoring(self, checked):
         if checked:
@@ -452,6 +645,62 @@ class KeyMapperApp(QWidget):
             self.window_selection_entry.setVisible(False)
             self.window_selection_combobox.setVisible(True)
 
+    def _on_kbd_suppression_toggled(self, checked: bool):
+        """Enable or disable low-level keyboard suppression at runtime.
+        When enabled we register hooks for all current mappings; when
+        disabled we unhook them so the normal pynput on_press handling
+        resumes.
+        """
+        # Try to enable/disable low-level suppression even when not elevated.
+        # Some environments will allow the hooks to be installed without
+        # administrative rights; attempt to install and if it fails notify the
+        # user and fall back to the high-level path without crashing.
+        self._kbd_enabled = bool(checked)
+
+        if self._kbd_available and self._kbd_enabled:
+            try:
+                # Attempt to create hooks. This may fail for lack of
+                # privileges or platform restrictions — surface a friendly
+                # warning to the user but keep the app running.
+                self._refresh_keyboard_hooks()
+                # Update status to show enabled (if we have a label)
+                try:
+                    self.kbd_status_label.setText("Low-level suppression enabled.")
+                    self.kbd_status_label.setStyleSheet('color: #8bc34a;')
+                except Exception:
+                    pass
+            except Exception as e:
+                # Failed to enable. Revert the toggle and notify user.
+                self._kbd_enabled = False
+                try:
+                    if self.kbd_suppression_checkbox:
+                        self.kbd_suppression_checkbox.setChecked(False)
+                except Exception:
+                    pass
+
+                try:
+                    QMessageBox.warning(self, "Enable failed", f"Failed to enable low-level suppression: {e}\nThe app will continue using high-level listeners.")
+                except Exception:
+                    # If QMessageBox cannot be shown (tests/headless), ignore
+                    pass
+
+                try:
+                    self.kbd_status_label.setText("Low-level suppression failed to enable. Using high-level listeners.")
+                    self.kbd_status_label.setStyleSheet('color: #e67e22;')
+                except Exception:
+                    pass
+        else:
+            try:
+                # When disabling, unhook any active keyboard hooks
+                self._unhook_all_keyboard_hooks()
+            except Exception:
+                pass
+            try:
+                self.kbd_status_label.setText("Low-level suppression disabled.")
+                self.kbd_status_label.setStyleSheet('color: #888888;')
+            except Exception:
+                pass
+
     def add_mapping(self):
         source_key = self.source_keyboard_combobox.currentText()
         mouse_button = self.mouse_button_combobox.currentText()
@@ -504,6 +753,12 @@ class KeyMapperApp(QWidget):
         }
         self.mapping_ids.append(mapping_id)
         self.update_mappings_display()
+        # Keep low-level hooks in sync when present
+        if self._kbd_available and getattr(self, '_kbd_enabled', False):
+            try:
+                self._refresh_keyboard_hooks()
+            except Exception:
+                pass
         self.clear()
 
     def add_keyboard_mapping(self):
@@ -537,6 +792,11 @@ class KeyMapperApp(QWidget):
         }
         self.mapping_ids.append(mapping_id)
         self.update_mappings_display()
+        if self._kbd_available and getattr(self, '_kbd_enabled', False):
+            try:
+                self._refresh_keyboard_hooks()
+            except Exception:
+                pass
         self.clear()
         
     def remove_mapping(self):
@@ -554,6 +814,12 @@ class KeyMapperApp(QWidget):
                 break
         
         self.update_mappings_display()
+        # Update low-level hooks if suppression is enabled
+        if self._kbd_available and getattr(self, '_kbd_enabled', False):
+            try:
+                self._refresh_keyboard_hooks()
+            except Exception:
+                pass
 
     def update_mappings_display(self):
         self.mappings_listbox.clear()
@@ -601,6 +867,11 @@ class KeyMapperApp(QWidget):
     def on_press(self, key):
         locker = QMutexLocker(self.mappings_lock)
         try:
+            # When using the low-level keyboard hooks we register separate
+            # handlers and suppress the original event, so skip the
+            # pynput on_press mapping behavior to avoid duplication.
+            if self._kbd_available and getattr(self, '_kbd_enabled', False):
+                return
             pressed_key = key.char if isinstance(key, keyboard.KeyCode) else key.name
             current_window = gw.getActiveWindow()
             if not pressed_key or not current_window:
@@ -612,22 +883,7 @@ class KeyMapperApp(QWidget):
                 if window_title in current_window_title:
                     for details in mappings.values():
                         if 'source_key' in details and details['source_key'] == pressed_key:
-                            target_key = details['target_key']
-                            
-                            parts = target_key.split(' + ')
-                            key_to_press_str = parts[-1].strip()
-                            modifiers_str = [p.strip() for p in parts[:-1]]
-
-                            key_to_press = getattr(Key, key_to_press_str, key_to_press_str)
-                            modifier_keys = [getattr(Key, m) for m in modifiers_str]
-                            
-                            if modifier_keys:
-                                with self.keyboard_controller.pressed(*modifier_keys):
-                                    self.keyboard_controller.press(key_to_press)
-                                    self.keyboard_controller.release(key_to_press)
-                            else:
-                                self.keyboard_controller.press(key_to_press)
-                                self.keyboard_controller.release(key_to_press)
+                            self.mapping_action_signal.emit(details['target_key'])
                             return
         except (AttributeError, KeyError, ValueError):
             pass
@@ -635,6 +891,7 @@ class KeyMapperApp(QWidget):
     def on_click(self, x, y, button, pressed):
         locker = QMutexLocker(self.mappings_lock)
         if not pressed:
+            # We only care about press events
             return
 
         active_window = gw.getActiveWindow()
@@ -646,45 +903,64 @@ class KeyMapperApp(QWidget):
 
         self.click_counts.setdefault(button_name, 0)
 
-        if self.last_click_time and (current_time - self.last_click_time) > 0.3:
+        last_click = self.last_click_time.get(button_name)
+        if last_click and (current_time - last_click) > self.click_interval:
             self.click_counts[button_name] = 0
         
         self.click_counts[button_name] += 1
-        self.last_click_time = current_time
+        self.last_click_time[button_name] = current_time
 
         target_window_title = active_window.title
+
+        # Find a matching mapping while holding the lock briefly, but don't
+        # perform the keyboard action inside the listener thread to avoid
+        # blocking the mouse listener. Instead collect action details and
+        # run them on a background thread.
+        action_to_run = None
 
         for partial_title, mappings in self.mappings.items():
             if partial_title in target_window_title:
                 for details in mappings.values():
-                    if 'mouse_button' not in details: continue
-                    
-                    if (details['mouse_button'] == button_name and 
-                        details['press_count'] == self.click_counts[button_name]):
-                        
+                    if 'mouse_button' not in details:
+                        continue
+
+                    if (details['mouse_button'] == button_name and
+                            details['press_count'] == self.click_counts[button_name]):
+
+                        # Reset click counter inside the lock quickly so any
+                        # subsequent clicks don't interfere.
                         self.click_counts[button_name] = 0
-                        keyboard_button = details['keyboard_button']
+                        action_to_run = details['keyboard_button']
+                        break
 
-                        # Convert to string for consistent processing
-                        kb_button_str = keyboard_button
-                        if isinstance(keyboard_button, Key):
-                            kb_button_str = keyboard_button.name
+                if action_to_run:
+                    break
 
-                        parts = kb_button_str.split(' + ')
-                        key_to_press_str = parts[-1].strip()
-                        modifiers_str = [p.strip() for p in parts[:-1]]
+        # release the lock (QMutexLocker destructor on function exit)
 
-                        key_to_press = getattr(Key, key_to_press_str, key_to_press_str)
-                        modifier_keys = [getattr(Key, m) for m in modifiers_str]
+        if not action_to_run:
+            return
 
-                        if modifier_keys:
-                            with self.keyboard_controller.pressed(*modifier_keys):
-                                self.keyboard_controller.press(key_to_press)
-                                self.keyboard_controller.release(key_to_press)
-                        else:
-                            self.keyboard_controller.press(key_to_press)
-                            self.keyboard_controller.release(key_to_press)
-                        return
+        # Run the actual keyboard press on a separate, short-lived thread
+        # so we don't block the mouse listener.
+        # Use Qt signal to queue action to main thread. This avoids
+        # the timing/focus problems that can happen when actions run in
+        # independent worker threads, and keeps the listener non-blocking.
+        self.mapping_action_signal.emit(action_to_run)
+
+    def _get_config_filepath(self):
+        """
+        Returns the platform-specific, user-writable path for the mappings.ini file.
+        """
+        # Use LOCALAPPDATA for Windows, which is the correct place for user-specific config.
+        app_data_path = os.environ.get('LOCALAPPDATA')
+        if not app_data_path:
+            # Fallback for unusual cases, though LOCALAPPDATA is standard on Windows.
+            return 'mappings.ini'
+
+        config_dir = os.path.join(app_data_path, 'S-Mapper')
+        os.makedirs(config_dir, exist_ok=True)
+        return os.path.join(config_dir, 'mappings.ini')
 
     def save_mappings_to_config(self):
         config = configparser.ConfigParser()
@@ -695,6 +971,11 @@ class KeyMapperApp(QWidget):
         all_mappings = {}
         for mappings_by_window in self.mappings.values():
             all_mappings.update(mappings_by_window)
+
+        # Persist application settings in a dedicated section so the
+        # click interval is preserved between runs.
+        config['Settings'] = {}
+        config['Settings']['click_interval'] = str(self.click_interval)
 
         for mapping_id, details in all_mappings.items():
             config[mapping_id] = {}
@@ -716,24 +997,93 @@ class KeyMapperApp(QWidget):
                 section['source_key'] = details['source_key']
                 section['target_key'] = details['target_key']
 
-        with open('mappings.ini', 'w') as configfile:
+        with open(self._get_config_filepath(), 'w') as configfile:
             config.write(configfile)
+
+    def _run_keyboard_action_worker(self, keyboard_button):
+        """
+        Worker used to execute keyboard press/release for a mapping off the
+        listener thread. Using a local Controller instance is safer and keeps
+        the listener responsive.
+        """
+        try:
+            # Use a dedicated Controller instance in this thread
+            local_controller = keyboard.Controller()
+
+            # Convert Key objects to their name string if necessary
+            if isinstance(keyboard_button, Key):
+                kb_button_str = keyboard_button.name
+            else:
+                kb_button_str = keyboard_button
+
+            # Parse modifiers and the main key
+            parts = kb_button_str.split(' + ')
+            key_to_press_str = parts[-1].strip()
+            modifiers_str = [p.strip() for p in parts[:-1] if p.strip()]
+
+            key_to_press = getattr(Key, key_to_press_str, key_to_press_str)
+            modifier_keys = [getattr(Key, m) for m in modifiers_str]
+
+            if modifier_keys:
+                with local_controller.pressed(*modifier_keys):
+                    local_controller.press(key_to_press)
+                    local_controller.release(key_to_press)
+            else:
+                local_controller.press(key_to_press)
+                local_controller.release(key_to_press)
+
+        except Exception as e:
+            # Keep logs minimal to avoid spamming the listener thread.
+            print(f"Mapping action failed: {e}")
+
+    def _handle_mapping_action(self, keyboard_button):
+        """
+        Slot executed on the GUI thread (via mapping_action_signal) that
+        runs the keyboard action using the shared controller. This keeps
+        key injection consistent with the app's main controller.
+        """
+        try:
+            # Use the shared controller already created by the app
+            kb_button = keyboard_button
+            if isinstance(kb_button, Key):
+                kb_button_str = kb_button.name
+            else:
+                kb_button_str = kb_button
+
+            parts = kb_button_str.split(' + ')
+            key_to_press_str = parts[-1].strip()
+            modifiers_str = [p.strip() for p in parts[:-1] if p.strip()]
+
+            key_to_press = getattr(Key, key_to_press_str, key_to_press_str)
+            modifier_keys = [getattr(Key, m) for m in modifiers_str]
+
+            if modifier_keys:
+                with self.keyboard_controller.pressed(*modifier_keys):
+                    self.keyboard_controller.press(key_to_press)
+                    self.keyboard_controller.release(key_to_press)
+            else:
+                self.keyboard_controller.press(key_to_press)
+                self.keyboard_controller.release(key_to_press)
+
+        except Exception as e:
+            print(f"Mapping action failed (main thread): {e}")
 
     def load_mappings_from_config(self):
         config = configparser.ConfigParser()
         config.optionxform = str
         
-        if not os.path.exists('mappings.ini'):
+        config_path = self._get_config_filepath()
+        if not os.path.exists(config_path):
             try:
                 # Create an empty file so the app can save to it later.
-                with open('mappings.ini', 'w') as configfile:
+                with open(config_path, 'w') as configfile:
                     pass
                 return # Stop here since there's nothing to load
             except IOError as e:
-                QMessageBox.critical(self, "File Creation Error", f"Failed to create mappings.ini: {e}")
+                QMessageBox.critical(self, "File Creation Error", f"Failed to create {config_path}: {e}")
                 return
 
-        config.read('mappings.ini')
+        config.read(config_path)
         highest_mapping_number = 0
 
         locker = QMutexLocker(self.mappings_lock)
@@ -790,15 +1140,260 @@ class KeyMapperApp(QWidget):
         self.mapping_counter = highest_mapping_number + 1
         self.update_mappings_display()
 
+        # Sync low-level hooks after loading mappings from disk
+        if self._kbd_available and getattr(self, '_kbd_enabled', False):
+            try:
+                self._refresh_keyboard_hooks()
+            except Exception:
+                pass
+
+        # Load click interval from settings if present
+        try:
+            if config.has_section('Settings') and config['Settings'].get('click_interval'):
+                val = float(config['Settings'].get('click_interval'))
+                # clamp to reasonable bounds
+                self.click_interval = max(0.05, min(5.0, val))
+                # update UI spinbox if available
+                try:
+                    self.click_interval_spinbox.setValue(self.click_interval)
+                except Exception:
+                    pass
+        except Exception:
+            # Fail silently — incorrect value shouldn't crash loading
+            pass
+
+    def _on_interval_changed(self, value: float):
+        # Called when the UI spinbox changes; keep internal state in sync
+        try:
+            self.click_interval = float(value)
+        except Exception:
+            pass
+
+    # --------------------- keyboard package integration -----------------
+    def _refresh_keyboard_hooks(self):
+        """
+        Register per-source-key keyboard hooks using the 'keyboard'
+        package. Hooks are installed with suppress=True so the original
+        key press will not be delivered to the OS when it matches a
+        configured mapping.
+        """
+        if not self._kbd_available:
+            return
+
+        # Build a fast lookup: source_key -> list of (window_title, target_key)
+        # so callbacks don't need to iterate the entire mapping set each time.
+        source_keys = set()
+        self._source_index.clear()
+        for mappings in self.mappings.values():
+            for details in mappings.values():
+                if 'source_key' in details and details['source_key']:
+                    sk = details['source_key']
+                    source_keys.add(sk)
+                    self._source_index.setdefault(sk, []).append(
+                        (details.get('window_title', ''), details.get('target_key'))
+                    )
+
+        # After rebuilding the index, update hooks to match the current
+        # active window title (so only keys targeted to the current
+        # app are intercepted).
+        # First, remove hooks that no longer correspond to any known keys
+        for k in list(self._keyboard_hooks.keys()):
+            if k not in source_keys:
+                try:
+                    kbd.unhook(self._keyboard_hooks[k])
+                except Exception:
+                    pass
+                del self._keyboard_hooks[k]
+
+        # Now build an index of active keys for the current active title and
+        # ensure hooks are only installed for those.
+        with self._active_title_lock:
+            active_title = self._cached_active_title
+
+        # Only update hooks for keys that match the active title.
+        self._update_hooks_for_active_title(active_title)
+        return
+
+    def _update_hooks_for_active_title(self, active_title: str):
+        """
+        Ensure that low-level keyboard hooks are installed only for
+        source keys which have mappings that match the provided
+        active_title. This is fast and runs on the GUI thread.
+        """
+        if not self._kbd_available or not getattr(self, '_kbd_enabled', False):
+            return
+
+        # Compute keys that match the active title
+        active_keys = set()
+        if active_title:
+            for sk, bucket in self._source_index.items():
+                for (w_title, _) in bucket:
+                    if w_title and (w_title.strip().lower() in active_title):
+                        active_keys.add(sk)
+                        break
+
+        # Add hooks for newly active keys
+        for key in active_keys:
+            if key in self._keyboard_hooks:
+                continue
+
+            # create a stable callback closure
+            def make_callback(src_key):
+                def callback(event):
+                    # only handle key down
+                    if event.event_type != 'down':
+                        return
+
+                    # periodically clean up expired ignore entries
+                    now = time.time()
+                    to_delete = [n for n, t in self._kbd_ignore.items() if t < now]
+                    for n in to_delete:
+                        del self._kbd_ignore[n]
+
+                    # If this press was caused by our own synthetic
+                    # input, ignore it here.
+                    if event.name in self._kbd_ignore:
+                        return
+
+                    # Quick safety: if any modifier key is held down
+                    # (ctrl/alt/shift/windows/meta) we SHOULD NOT
+                    # intercept this press — let hotkeys like Ctrl+C
+                    # behave normally. Re-send the original key so the
+                    # suppressed hardware event is delivered.
+                    try:
+                        if any(kbd.is_pressed(m) for m in ('ctrl', 'shift', 'alt', 'win', 'windows', 'meta', 'cmd')):
+                            # short ignore to avoid loop when re-sending
+                            expiry2 = time.time() + 0.25
+                            self._kbd_ignore[event.name] = expiry2
+                            kbd.send(event.name)
+                            return
+                    except Exception:
+                        # If checking modifier state fails for any reason
+                        # fall back to existing behavior and continue.
+                        pass
+
+                    # Use the cached active window title (updated periodically
+                    # on the GUI thread) instead of calling getActiveWindow()
+                    # inside the hot path.
+                    with self._active_title_lock:
+                        title = self._cached_active_title
+                    if not title:
+                        return
+
+                    # Look up matching mappings for this source key only
+                    bucket = self._source_index.get(src_key, [])
+                    for (w_title, tk) in bucket:
+                        # Only match when a non-empty mapping window title is
+                        # provided and is present as a substring in the
+                        # active window title (case-insensitive).
+                        if w_title and (w_title.strip().lower() in title.lower()):
+                            # Mark the target as ignored briefly to avoid
+                            # re-triggering our hooks when we inject synthetic
+                            # events. Normalize the target into the 'keyboard'
+                            # package format (e.g. 'ctrl+alt+d').
+                            # Shorter expiry — only needed to filter the
+                            # synthetic injected target key event so it
+                            # doesn't retrigger hooks.
+                            expiry = time.time() + 0.25
+                            if isinstance(tk, Key):
+                                tn = tk.name
+                            else:
+                                # Convert space-padded "ctrl + alt + d" -> "ctrl+alt+d"
+                                tn = str(tk).replace(' + ', '+').replace(' ', '')
+
+                            self._kbd_ignore[tn] = expiry
+
+                            try:
+                                # Inject the mapped key using the keyboard package
+                                # directly for minimal latency.
+                                kbd.send(tn)
+                            except Exception:
+                                # Fallback: if send fails, emit to main thread
+                                # for the shared controller path.
+                                self.mapping_action_signal.emit(tk)
+
+                            return
+
+                    # No mapping matched for the active window — we
+                    # must re-emit the original source key so normal
+                    # behavior is preserved. The hook was installed with
+                    # suppress=True so the original hardware event was
+                    # swallowed by the library; here we send a synthetic
+                    # keypress which will be delivered to the active app.
+                    try:
+                        expiry2 = time.time() + 0.25
+                        self._kbd_ignore[event.name] = expiry2
+                        kbd.send(event.name)
+                    except Exception:
+                        # best-effort: if re-send fails nothing else to do
+                        pass
+
+                    return
+
+                return callback
+
+            try:
+                handler = kbd.on_press_key(key, make_callback(key), suppress=True)
+                self._keyboard_hooks[key] = handler
+            except Exception:
+                # Ignore failures adding a hook for a particular key.
+                pass
+
+        # Unhook any active hooks for keys that are no longer matching
+        for k in list(self._keyboard_hooks.keys()):
+            if k not in active_keys:
+                try:
+                    kbd.unhook(self._keyboard_hooks[k])
+                except Exception:
+                    pass
+                del self._keyboard_hooks[k]
+
+    def _unhook_all_keyboard_hooks(self):
+        if not self._kbd_available:
+            return
+
+        for h in list(self._keyboard_hooks.values()):
+            try:
+                kbd.unhook(h)
+            except Exception:
+                pass
+        self._keyboard_hooks.clear()
+
 
     def closeEvent(self, event):
         self.save_mappings_to_config()
         self.keyboard_thread.stop()
+        # Wait briefly for listener threads to shut down so we exit cleanly
+        # instead of leaving background listeners still running. Use a
+        # short timeout to avoid blocking shutdown indefinitely.
+        try:
+            self.keyboard_thread.wait(1000)
+        except Exception:
+            # Best effort; continue shutdown even if wait fails
+            pass
+
         self.mouse_thread.stop()
+        try:
+            self.mouse_thread.wait(1000)
+        except Exception:
+            pass
+        # Stop the active-title timer and remove any low-level keyboard hooks that were installed.
+        try:
+            self._active_title_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._unhook_all_keyboard_hooks()
+        except Exception:
+            pass
         self.tray_icon.hide()
         event.accept()
 
 if __name__ == "__main__":
+    # Enable High-DPI scaling before creating the QApplication
+    # This is the most reliable method across Qt versions
+    os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
+    os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
     app = QApplication(sys.argv)
     ex = KeyMapperApp()
     ex.show()

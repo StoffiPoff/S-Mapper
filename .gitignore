@@ -9,6 +9,9 @@
 # Ignore Inno Setup output
 /installer/
 /s_mapper_setup.iss
+*.msix
+*.msi
+*.exe
 
 # ===============================
 # --- Python Cache & Deps ---
@@ -19,7 +22,8 @@ __pycache__/
 *.pyd
 
 # Ignore local Python environment
-/python311/
+/.venv/
+.venv
 
 # ===============================
 # --- User & Old Files ---
@@ -50,3 +54,17 @@ open-key-mapper-app.bat
 *~
 microsoft.*
 _internal*
+
+# Pytest cache
+.pytest_cache/
+
+# Build artifacts from pyinstaller
+/build/**
+/dist/**
+
+# Windows store / package artifacts
+*.msix
+installer/*.msix
+
+# Ignore VS Code workspace settings (user specific)
+.vscode/*

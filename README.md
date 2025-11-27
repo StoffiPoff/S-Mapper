@@ -62,3 +62,81 @@ The `mappings.ini` file stores your mappings. While it's managed by the applicat
 ## License
 
 This project is licensed under the MIT License. See the `LICENSE` file for details.
+
+## Optional: improved suppression on Windows
+
+S-Mapper can optionally use the `keyboard` Python package to perform low-level
+suppression of mapped source keys on Windows. This prevents the original key
+event from being delivered to the OS (so only your mapped target is seen), and
+is more robust than attempting to delete characters with backspace.
+
+Notes:
+- Install the package in your app environment: `pip install keyboard` (the
+    repository's virtual environment is used during development).
+- The `keyboard` library exposes a global keyboard hook. On some systems, this
+    may require additional privileges — see the `keyboard` project's docs if you
+    run into permissions issues.
+- If the `keyboard` package is not installed, S-Mapper will fall back to the
+    original behavior (no suppression) so mappings still function, but the source
+    key may still be delivered to the target application.
+
+UI toggle:
+- S-Mapper now includes a UI checkbox (shown when the `keyboard` package is
+    available) that enables or disables the low-level suppression at runtime.
+    When disabled, the app uses the older pynput-based path (no suppression).
+    When enabled, the app installs per-source key hooks that suppress the
+    original event only when the active window matches your mapping. If the
+    mapping does not match the active window the original key is re-sent
+    immediately so normal behavior continues.
+
+Performance: cached active window title
+- To further reduce latency, S-Mapper caches the active window title on the
+    GUI thread and updates it periodically (100ms). The low-level keyboard hook
+    Behavior with modifiers:
+    - By default S-Mapper will not intercept a remapped key while any modifier
+        key is held (Ctrl/Alt/Shift/Win/Meta). This avoids changing hotkey behavior
+        like Ctrl+C becoming Ctrl+D when mapping `c -> d`. When a modifier is held
+        the original keypress is re-sent immediately and no mapping is applied.
+    reads this cached title under a small lock instead of calling `pygetwindow`
+    on every keypress. This significantly reduces work inside the hook and
+    lowers end-to-end latency for remapped keys.
+
+Two recommended distribution variants
+----------------------------------
+
+If you plan to ship S-Mapper to users, you may want to produce two distinct
+release variants so the app works well both for users who can run elevated and
+for those who cannot or prefer a lower-privilege build:
+
+- **Full build (Power-user / elevated)**
+    - Includes the `keyboard` package (and any native/CTypes bits it needs) so
+        low-level suppression can be used. This variant is intended for users who
+        run with elevated privileges and want the cleanest suppression behavior.
+    - When packaging as an MSIX, ensure the Appx manifest allows the binary to
+        run with full trust (runFullTrust) and test behavior in AppContainer vs
+        full-trust contexts. Many low-level hooks are blocked by UWP/AppContainer
+        policies, so this package may need different installer/manifest settings.
+    - Optionally recommend users run the packaged app "as administrator" if the
+        keyboard hooks require administrative privileges on their setup.
+
+- **Lite build (non-elevated / sandbox-safe)**
+    - Does not include the `keyboard` package and avoids requiring elevated
+        privileges. This variant still supports all mapping features via the
+        high-level `pynput` listeners — however, suppression of original key
+        events may not be perfect and some targeted behavior could be less
+        consistent than the full build.
+    - Use this when you need the app to run inside AppContainer or without
+        administrative approval.
+
+Packaging & CI notes
+--------------------
+- Produce two MSIX/installer artifacts (for example `S-Mapper-full.msix` and
+    `S-Mapper-lite.msix`). The difference is the presence/absence of the
+    `keyboard` package in the payload and any manifest flags controlling
+    runFullTrust/elevation. Test both artifacts on a clean VM to ensure they
+    behave as expected.
+- When using PyInstaller to produce a single EXE packaging, ensure the
+    environment used by PyInstaller includes or excludes `keyboard` depending on
+    which build you want.
+- Document for end users when elevation is required and how to choose the right
+    build for their needs.
