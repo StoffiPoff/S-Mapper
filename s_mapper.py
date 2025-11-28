@@ -23,7 +23,23 @@ from PyQt6.QtCore import QThread, pyqtSignal, Qt, QMutex, QMutexLocker, QTimer, 
 from PyQt6.QtGui import QCursor, QIcon, QAction
 from pynput import mouse, keyboard
 import threading
-import pygetwindow as gw
+try:
+    import pygetwindow as gw
+except Exception:
+    # When running tests or in stripped environments the optional
+    # pygetwindow package may not be present. Provide a small shim so
+    # the rest of the module can import and tests can run without
+    # importing the optional dependency.
+    class _GWStub:
+        @staticmethod
+        def getActiveWindow():
+            return None
+
+        @staticmethod
+        def getWindowsWithTitle(title):
+            return []
+
+    gw = _GWStub()
 from pynput.keyboard import Key
 
 # Optional low-level keyboard interception via the 'keyboard' package.
@@ -156,19 +172,25 @@ class PingThread(QThread):
     def __init__(self, ip_address):
         super().__init__()
         self.ip_address = ip_address
+        # store the child process to allow an external stop to terminate it
+        self._proc = None
+        self._stopped = False
 
     def run(self):
         try:
-            # The command for Windows
+            # The command for Windows; use Popen so we can terminate it if
+            # required during shutdown.
             command = ['ping', '-n', '4', self.ip_address]
-            result = subprocess.run(
-                command, 
-                capture_output=True, 
-                text=True, 
+            self._proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
-            
-            output = result.stdout.lower()
+
+            output, _ = self._proc.communicate()
+            output = (output or '').lower()
             if "received = 0" in output or "100% loss" in output:
                 self.ping_result.emit('red')
             else:
@@ -177,6 +199,20 @@ class PingThread(QThread):
         except Exception as e:
             print(f"Ping failed: {e}")
             self.ping_result.emit('red')
+
+    def stop(self):
+        """Stop the running ping subprocess if present and request the thread to end."""
+        self._stopped = True
+        try:
+            if self._proc and self._proc.poll() is None:
+                # Best-effort terminate; if it refuses to die use kill
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=1)
+                except Exception:
+                    self._proc.kill()
+        except Exception:
+            pass
 
 class KeyMapperApp(QWidget):
     # Signal used to run mapping actions on the main (GUI) thread. Emitting
@@ -229,9 +265,14 @@ class KeyMapperApp(QWidget):
         self._active_title_timer.timeout.connect(self._update_cached_active_title)
         self._active_title_timer.start()
 
+        # Keep track of any active ping threads so we can stop them during
+        # shutdown and avoid leaving subprocesses running after the GUI exits.
+        self._ping_threads = set()
+
     def initUI(self):
         self.setWindowTitle("S-Mapper")
-        self.setWindowIcon(QIcon(resource_path('icon.png')))
+        # Use the app store / assets icon for the window icon
+        self.setWindowIcon(QIcon(resource_path(os.path.join('assets', 'Square150x150Logo.png'))))
         self.setGeometry(100, 100, 800, 800)
 
         # Dark mode stylesheet
@@ -489,24 +530,63 @@ class KeyMapperApp(QWidget):
         self.update_window_selection_visibility()
 
         # --- System Tray Icon ---
-        self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(QIcon(resource_path('icon.png')))
-        self.tray_icon.setToolTip("S-Mapper App")
+        # Detect whether the system tray is available on this platform / session.
+        # Some runtime environments (AppContainer/MSIX, headless sessions, or
+        # restrictive remote sessions) may not provide a system tray — guard
+        # the minimize-to-tray behavior accordingly.
+        self._tray_available = QSystemTrayIcon.isSystemTrayAvailable()
 
-        tray_menu = QMenu()
-        show_action = QAction("Show", self)
-        quit_action = QAction("Exit", self)
+        # Try to load the icon; if loading fails we'll also consider the tray
+        # effectively unavailable so we don't end up hiding the window and
+        # losing the user when showMessage can't be delivered.
+        # Prefer the smaller 44x44 asset for the tray icon (better for small tray sizes)
+        icon = QIcon(resource_path(os.path.join('assets', 'Square44x44Logo.png')))
+        if icon.isNull():
+            # Icon failed to load. Log a short diagnostic and disable tray usage.
+            print('s_mapper: warning - tray icon failed to load, disabling tray behavior')
+            self._tray_available = False
 
-        show_action.triggered.connect(self.show_window)
-        quit_action.triggered.connect(self.close)
+        if self._tray_available:
+            self.tray_icon = QSystemTrayIcon(self)
+            try:
+                self.tray_icon.setIcon(icon)
+            except Exception:
+                # Guard against unexpected errors setting an icon
+                print('s_mapper: warning - failed to set tray icon')
+            self.tray_icon.setToolTip("S-Mapper App")
 
-        tray_menu.addAction(show_action)
-        tray_menu.addAction(quit_action)
+            tray_menu = QMenu()
+            show_action = QAction("Show", self)
+            quit_action = QAction("Exit", self)
 
-        self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.show()
+            show_action.triggered.connect(self.show_window)
+            quit_action.triggered.connect(self.close)
 
-        self.tray_icon.activated.connect(self.on_tray_icon_activated)
+            tray_menu.addAction(show_action)
+            tray_menu.addAction(quit_action)
+
+            try:
+                self.tray_icon.setContextMenu(tray_menu)
+            except Exception:
+                print('s_mapper: warning - failed to set tray context menu')
+
+            # show may be a no-op in some environments but calling it is fine
+            try:
+                self.tray_icon.show()
+            except Exception:
+                # Don't crash if the tray can't be shown
+                print('s_mapper: warning - tray_icon.show() failed')
+
+            # Only connect activation handler if we actually have a working tray
+            try:
+                self.tray_icon.activated.connect(self.on_tray_icon_activated)
+            except Exception:
+                # If connecting fails, degrade gracefully
+                print('s_mapper: warning - failed to connect tray activation')
+        else:
+            # No system tray available in this environment — store a lightweight
+            # None so other code can detect and fall back.
+            self.tray_icon = None
 
     def start_listeners(self):
         self.keyboard_thread = KeyboardListenerThread(self)
@@ -578,9 +658,12 @@ class KeyMapperApp(QWidget):
             cursor_pos = QCursor.pos()
             self.ping_status_label.show_message("Ping sent...", "#FFA500", cursor_pos) # Orange
             self.mouse_thread.mouse_moved.connect(self.update_label_position)
-            self.ping_thread = PingThread(clipboard_text)
-            self.ping_thread.ping_result.connect(self.update_ping_indicator)
-            self.ping_thread.start()
+            pt = PingThread(clipboard_text)
+            pt.ping_result.connect(self.update_ping_indicator)
+            # Track active ping threads to allow orderly shutdown.
+            self._ping_threads.add(pt)
+            pt.finished.connect(lambda: self._ping_threads.discard(pt))
+            pt.start()
 
     def update_ping_indicator(self, color):
         self.ping_status_indicator.setStyleSheet(f"background-color: {color}; border-radius: 10px;")
@@ -855,14 +938,38 @@ class KeyMapperApp(QWidget):
     def changeEvent(self, event):
         if event.type() == QEvent.Type.WindowStateChange:
             if self.isMinimized():
-                self.hide()
-                self.tray_icon.showMessage(
-                    "S-Mapper",
-                    "Application was minimized to tray.",
-                    QSystemTrayIcon.MessageIcon.Information,
-                    2000
-                )
-        super().changeEvent(event)
+                # Only minimize-to-tray if we have a usable system tray and icon
+                if getattr(self, '_tray_available', False) and getattr(self, 'tray_icon', None):
+                    try:
+                        self.hide()
+                        # showMessage may raise or be ignored depending on platform
+                        try:
+                            self.tray_icon.showMessage(
+                                "S-Mapper",
+                                "Application was minimized to tray.",
+                                QSystemTrayIcon.MessageIcon.Information,
+                                2000
+                            )
+                        except Exception:
+                            print('s_mapper: warning - tray_icon.showMessage() failed')
+                    except Exception:
+                        # If hiding fails for some reason, avoid leaving the
+                        # application invisible with no recovery path — keep it
+                        # visible instead.
+                        print('s_mapper: warning - hide() failed while minimizing; leaving window visible')
+                else:
+                    # If the system tray is not available, do not hide the window
+                    # when minimized. This provides a safe fallback for environments
+                    # where the tray is not present (e.g., MSIX/AppContainer).
+                    print('s_mapper: system tray unavailable - not hiding window on minimize')
+        # In some test or shim scenarios the instance we bound the method to
+        # won't be a true QWidget instance and calling super().changeEvent
+        # will raise a TypeError. Guard this call so tests and thin stubs can
+        # exercise the logic above without failing.
+        try:
+            super().changeEvent(event)
+        except Exception:
+            pass
 
     def on_press(self, key):
         locker = QMutexLocker(self.mappings_lock)
@@ -1361,32 +1468,108 @@ class KeyMapperApp(QWidget):
 
 
     def closeEvent(self, event):
-        self.save_mappings_to_config()
-        self.keyboard_thread.stop()
-        # Wait briefly for listener threads to shut down so we exit cleanly
-        # instead of leaving background listeners still running. Use a
-        # short timeout to avoid blocking shutdown indefinitely.
+        # Persist settings first
         try:
-            self.keyboard_thread.wait(1000)
+            self.save_mappings_to_config()
         except Exception:
-            # Best effort; continue shutdown even if wait fails
             pass
 
-        self.mouse_thread.stop()
+        # Stop and wait for ping threads (best effort)
         try:
-            self.mouse_thread.wait(1000)
+            for pt in list(getattr(self, '_ping_threads', [])):
+                try:
+                    pt.stop()
+                except Exception:
+                    pass
+            # Give ping threads a moment to exit
+            for pt in list(getattr(self, '_ping_threads', [])):
+                try:
+                    pt.wait(1000)
+                except Exception:
+                    pass
         except Exception:
             pass
-        # Stop the active-title timer and remove any low-level keyboard hooks that were installed.
+
+        # Stop listeners and wait for them. If they don't stop in a reasonable
+        # time, attempt stronger termination to avoid leaving background
+        # processes running after the GUI closes.
+        def _stop_and_wait(thread_obj, name, timeout_ms=2000):
+            try:
+                if thread_obj:
+                    try:
+                        thread_obj.stop()
+                    except Exception:
+                        pass
+                    try:
+                        if not thread_obj.wait(timeout_ms):
+                            # If wait returned False, try to terminate the thread
+                            try:
+                                thread_obj.terminate()
+                            except Exception:
+                                pass
+                            try:
+                                thread_obj.wait(500)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                print(f's_mapper: warning - failed to stop/kill {name}')
+
+        _stop_and_wait(getattr(self, 'keyboard_thread', None), 'keyboard_thread')
+        _stop_and_wait(getattr(self, 'mouse_thread', None), 'mouse_thread')
+
+        # Stop periodic timers
         try:
             self._active_title_timer.stop()
         except Exception:
             pass
+
+        # Remove any low-level hooks
         try:
             self._unhook_all_keyboard_hooks()
         except Exception:
             pass
-        self.tray_icon.hide()
+
+        # Remove tray icon if present
+        try:
+            if getattr(self, 'tray_icon', None):
+                try:
+                    self.tray_icon.hide()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Allow Qt main loop to exit -- ensures the app finishes cleanly.
+        try:
+            QApplication.quit()
+        except Exception:
+            pass
+
+        # Last-resort: if configured, force the process to exit to ensure no
+        # lingering background threads/processes remain. This is intended as
+        # a last-resort option exposed via the environment variable
+        # S_MAPPER_FORCE_EXIT_ON_CLOSE or an instance attribute
+        # KeyMapperApp.force_exit_on_close = True.
+        try:
+            env_force = os.environ.get('S_MAPPER_FORCE_EXIT_ON_CLOSE', '')
+            fb = getattr(self, 'force_exit_on_close', False)
+            env_flag = str(env_force).lower() in ('1', 'true', 'yes', 'on')
+            if fb or env_flag:
+                try:
+                    # Use os._exit to force immediate termination (no cleanup).
+                    os._exit(0)
+                except SystemExit:
+                    # os._exit doesn't raise, but just in case default path
+                    # raises SystemExit, fall back to exit(0).
+                    try:
+                        sys.exit(0)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         event.accept()
 
 if __name__ == "__main__":

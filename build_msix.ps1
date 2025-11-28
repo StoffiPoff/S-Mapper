@@ -32,6 +32,22 @@ function ReEncode-Manifest {
     [System.IO.File]::WriteAllText($FilePath, $content, [System.Text.UTF8Encoding]::new($false))
 }
 
+# Optional variant parameter: full, lite, or both
+param(
+    [ValidateSet('full','lite','both')]
+    [string]$Variant = 'both'
+)
+
+# Allow overriding the variant with an environment variable (useful when
+# calling the script in contexts where parameters don't bind properly).
+if ($env:BUILD_VARIANT) {
+    $ev = $env:BUILD_VARIANT.ToLower()
+    if ($ev -in @('full','lite','both')) {
+        Write-Host "BUILD_VARIANT environment variable detected: $ev (overrides parameter)" -ForegroundColor Yellow
+        $Variant = $ev
+    }
+}
+
 # --- Main Logic ---
 # 1. Check for dependencies
 if (-not (Test-Path -Path $PythonExe)) {
@@ -58,11 +74,19 @@ if (-not (Test-Path -Path $InstallerPath)) {
 New-Item -Path $BuildPath -ItemType Directory
 New-Item -Path $AppxPath -ItemType Directory
 
-# 3. Run PyInstaller to create the executable
-& $pyInstallerPath --noconfirm --onefile --windowed --icon "icon.png" "s_mapper.py"
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "PyInstaller failed to build the executable. See the log above for details." -ForegroundColor Red
-    exit 1
+# 3. Build executables depending on the desired variant
+if ($Variant -eq 'full' -or $Variant -eq 'both') {
+    Write-Host "Building full variant (includes keyboard if present in venv)" -ForegroundColor Cyan
+    # Ensure the assets folder is embedded into the onefile binary so icons
+    # are available internally and don't rely on an external folder at runtime.
+    & $pyInstallerPath --noconfirm --onefile --windowed --name s_mapper_full --icon "assets\Square150x150Logo.png" --add-data "assets;assets" "s_mapper.py"
+    if ($LASTEXITCODE -ne 0) { Write-Host "PyInstaller failed to build full variant" -ForegroundColor Red; exit 1 }
+}
+
+if ($Variant -eq 'lite' -or $Variant -eq 'both') {
+    Write-Host "Building lite variant (explicitly excludes 'keyboard' to avoid low-level suppression dependency)" -ForegroundColor Cyan
+    & $pyInstallerPath --noconfirm --onefile --windowed --name s_mapper_lite --icon "assets\Square150x150Logo.png" --add-data "assets;assets" --exclude-module keyboard "s_mapper.py"
+    if ($LASTEXITCODE -ne 0) { Write-Host "PyInstaller failed to build lite variant" -ForegroundColor Red; exit 1 }
 }
 
 # 4. Clean and re-encode the AppxManifest.xml to be safe
@@ -103,46 +127,50 @@ function Prepare-ManifestCopy {
 # 5. Build two variants using PyInstaller
 
 Write-Host "Building full variant (includes keyboard if present in venv)" -ForegroundColor Cyan
-& $pyInstallerPath --noconfirm --onefile --windowed --name s_mapper_full --icon "icon.png" "s_mapper.py"
+& $pyInstallerPath --noconfirm --onefile --windowed --name s_mapper_full --icon "assets\Square150x150Logo.png" --add-data "assets;assets" "s_mapper.py"
 if ($LASTEXITCODE -ne 0) { Write-Host "PyInstaller failed to build full variant" -ForegroundColor Red; exit 1 }
 
 Write-Host "Building lite variant (explicitly excludes 'keyboard' to avoid low-level suppression dependency)" -ForegroundColor Cyan
-& $pyInstallerPath --noconfirm --onefile --windowed --name s_mapper_lite --icon "icon.png" --exclude-module keyboard "s_mapper.py"
+& $pyInstallerPath --noconfirm --onefile --windowed --name s_mapper_lite --icon "assets\Square150x150Logo.png" --add-data "assets;assets" --exclude-module keyboard "s_mapper.py"
 if ($LASTEXITCODE -ne 0) { Write-Host "PyInstaller failed to build lite variant" -ForegroundColor Red; exit 1 }
 
 # 6. Create separate appx folders for full + lite and copy required files
 $AppxFull = Join-Path -Path $AppxPath -ChildPath "full"
 $AppxLite = Join-Path -Path $AppxPath -ChildPath "lite"
-New-Item -Path $AppxFull -ItemType Directory -Force | Out-Null
-New-Item -Path $AppxLite -ItemType Directory -Force | Out-Null
+# Create appx directories and copy executables/assets only for requested variants
+if ($Variant -eq 'full' -or $Variant -eq 'both') {
+    New-Item -Path $AppxFull -ItemType Directory -Force | Out-Null
+    # Copy full executable + assets. The manifest expects the executable to be
+    # named "s_mapper.exe" so we copy into that filename to keep the manifest
+    # consistent.
+    Copy-Item -Path "dist\s_mapper_full.exe" -Destination (Join-Path -Path $AppxFull -ChildPath 's_mapper.exe')
+    Copy-Item -Path "assets" -Destination $AppxFull -Recurse
+    Prepare-ManifestCopy -DestinationFolder $AppxFull -Variant 'full'
+}
 
-# Copy full executable + assets. The manifest expects the executable to be
-# named "s_mapper.exe" so we copy into that filename to keep the manifest
-# consistent.
-Copy-Item -Path "dist\s_mapper_full.exe" -Destination (Join-Path -Path $AppxFull -ChildPath 's_mapper.exe')
-Copy-Item -Path "assets" -Destination $AppxFull -Recurse
-
-# Copy lite executable + assets. Also copy the lite exe to s_mapper.exe so
-# the manifest's Executable attribute matches the file inside the package.
-Copy-Item -Path "dist\s_mapper_lite.exe" -Destination (Join-Path -Path $AppxLite -ChildPath 's_mapper.exe')
-Copy-Item -Path "assets" -Destination $AppxLite -Recurse
-
-# Prepare manifests
-Prepare-ManifestCopy -DestinationFolder $AppxFull -Variant 'full'
-Prepare-ManifestCopy -DestinationFolder $AppxLite -Variant 'lite'
+if ($Variant -eq 'lite' -or $Variant -eq 'both') {
+    New-Item -Path $AppxLite -ItemType Directory -Force | Out-Null
+    Copy-Item -Path "dist\s_mapper_lite.exe" -Destination (Join-Path -Path $AppxLite -ChildPath 's_mapper.exe')
+    Copy-Item -Path "assets" -Destination $AppxLite -Recurse
+    Prepare-ManifestCopy -DestinationFolder $AppxLite -Variant 'lite'
+}
 
 # 7. Create the MSIX packages
-Write-Host "Creating full MSIX" -ForegroundColor Cyan
-& $makeAppxPath pack /d $AppxFull /p "$InstallerPath\$PackageName-full.msix" /o
-if ($LASTEXITCODE -ne 0) { Write-Host "makeappx failed for full" -ForegroundColor Red; exit 1 }
+if ($Variant -eq 'full' -or $Variant -eq 'both') {
+    Write-Host "Creating full MSIX" -ForegroundColor Cyan
+    & $makeAppxPath pack /d $AppxFull /p "$InstallerPath\$PackageName-full.msix" /o
+    if ($LASTEXITCODE -ne 0) { Write-Host "makeappx failed for full" -ForegroundColor Red; exit 1 }
+}
 
-Write-Host "Creating lite MSIX" -ForegroundColor Cyan
-& $makeAppxPath pack /d $AppxLite /p "$InstallerPath\$PackageName-lite.msix" /o
-if ($LASTEXITCODE -ne 0) { Write-Host "makeappx failed for lite" -ForegroundColor Red; exit 1 }
+if ($Variant -eq 'lite' -or $Variant -eq 'both') {
+    Write-Host "Creating lite MSIX" -ForegroundColor Cyan
+    & $makeAppxPath pack /d $AppxLite /p "$InstallerPath\$PackageName-lite.msix" /o
+    if ($LASTEXITCODE -ne 0) { Write-Host "makeappx failed for lite" -ForegroundColor Red; exit 1 }
+}
 
 # 7. Sign the MSIX package (optional but recommended for local testing)
 # You may need to create a self-signed certificate for this.
 # Example:
 # signtool sign /a /fd SHA256 /f "my_certificate.pfx" /p "my_password" "$InstallerPath\$PackageName.msix"
 
-Write-Host "MSIX package created at $InstallerPath\$PackageName.msix" -ForegroundColor Green
+Write-Host "MSIX packages built (variant: $Variant). See $InstallerPath" -ForegroundColor Green

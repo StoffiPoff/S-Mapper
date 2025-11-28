@@ -5,8 +5,11 @@ m = importlib.import_module('s_mapper')
 
 
 def test_resource_path_resolves_to_module_dir():
-    res = m.resource_path('icon.png')
-    expected = os.path.join(os.path.dirname(m.__file__), 'icon.png')
+    # The app bundles icons inside the 'assets' folder; make sure our helper
+    # resolves an assets path correctly during development.
+    rel = os.path.join('assets', 'Square44x44Logo.png')
+    res = m.resource_path(rel)
+    expected = os.path.join(os.path.dirname(m.__file__), rel)
     assert os.path.isabs(res)
     assert os.path.normcase(res) == os.path.normcase(expected)
     # the icon exists in the repo as a basic sanity check
