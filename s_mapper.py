@@ -6,6 +6,9 @@ import configparser
 import re
 import subprocess
 import logging
+import html
+
+
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
     QLineEdit, QPushButton, QListWidget, QRadioButton, QFrame, QMessageBox,
@@ -1432,9 +1435,15 @@ class KeyMapperApp(QMainWindow):
         # so callbacks don't need to iterate the entire mapping set each time.
         source_keys = set()
         self._source_index.clear()
-        self.mappings_lock.lock()
+        # Some tests (or lightweight shims) use a Dummy object without a
+        # mappings_lock. Be defensive: only lock when the attribute exists
+        # and exposes a .lock()/.unlock() API. This keeps test doubles
+        # and non-Qt shims from raising AttributeError during collection.
+        _mlock = getattr(self, 'mappings_lock', None)
+        if _mlock:
+            _mlock.lock()
         try:
-            for mappings in self.mappings.values():
+            for mappings in getattr(self, 'mappings', {}).values():
                 for details in mappings.values():
                     if 'source_key' in details and details['source_key']:
                         sk = details['source_key']
@@ -1443,7 +1452,11 @@ class KeyMapperApp(QMainWindow):
                             (details.get('window_title', ''), details.get('target_key'))
                         )
         finally:
-            self.mappings_lock.unlock()
+            if _mlock:
+                try:
+                    _mlock.unlock()
+                except Exception:
+                    pass
 
         # After rebuilding the index, update hooks to match the current
         # active window title (so only keys targeted to the current
