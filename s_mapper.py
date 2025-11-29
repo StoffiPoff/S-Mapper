@@ -1,26 +1,19 @@
 import sys
 import os
 import time
+import json
 import configparser
 import re
 import subprocess
-
-# Properties for the executable
-__company__ = "JafsWorks"
-__product__ = "Stoffi-S-Mapper"
-__version__ = "1.0.0"
-__description__ = "A versatile tool for remapping keyboard and mouse inputs."
-__copyright__ = "Copyright (c) 2025 JafsWorks"
-__license__ = "MIT"
-__internal_name__ = "stoffi-s-mapper"
-
+import logging
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
     QLineEdit, QPushButton, QListWidget, QRadioButton, QFrame, QMessageBox,
-    QSystemTrayIcon, QMenu, QDoubleSpinBox, QScrollArea
+    QSystemTrayIcon, QMenu, QDoubleSpinBox, QScrollArea, QTabWidget, QTextEdit,
+    QMainWindow, QToolBar, QTextBrowser
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QMutex, QMutexLocker, QTimer, QEvent
-from PyQt6.QtGui import QCursor, QIcon, QAction
+from PyQt6.QtGui import QCursor, QIcon, QAction, QTextCursor
 from pynput import mouse, keyboard
 import threading
 try:
@@ -97,6 +90,89 @@ def resource_path(relative_path):
 
     return os.path.join(base_path, relative_path)
 
+def get_log_filepath():
+    """
+    Returns the platform-specific, user-writable path for the error.log file.
+    """
+    try:
+        app_data_path = os.environ.get('LOCALAPPDATA')
+        if not app_data_path:
+            app_data_path = os.path.expanduser(r"~\AppData\Local")
+
+        log_dir = os.path.join(app_data_path, 'S-Mapper')
+        os.makedirs(log_dir, exist_ok=True)
+        return os.path.join(log_dir, 'error.log')
+    except Exception:
+        return 'error.log'
+
+class HelpWindow(QWidget):
+    """Simple help viewer with a list of topics and an HTML content pane."""
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("S-Mapper Help")
+        self.setWindowIcon(QIcon(resource_path(os.path.join('assets', 'Square44x44Logo.png'))))
+        self.setGeometry(200, 200, 700, 500)
+        self.initUI()
+
+    def initUI(self):
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                font-size: 10pt;
+            }
+            QListWidget {
+                background-color: #252526;
+                border: 1px solid #3a3d41;
+            }
+            QTextBrowser {
+                background-color: #252526;
+                border: 1px solid #3a3d41;
+            }
+        """)
+        layout = QHBoxLayout(self)
+
+        self.topics_list = QListWidget()
+        self.topics_list.setMaximumWidth(220)
+        layout.addWidget(self.topics_list)
+
+        self.content_display = QTextBrowser()
+        self.content_display.setOpenExternalLinks(True)
+        layout.addWidget(self.content_display)
+
+        self.topics_list.currentItemChanged.connect(self.display_topic)
+        self.populate_help()
+
+    def populate_help(self):
+        # Prefer loading the help file from the assets folder, fallback to a
+        # tiny built-in help if that fails for whatever reason.
+        try:
+            path = resource_path(os.path.join('assets', 'help_topics.json'))
+            with open(path, 'r', encoding='utf-8') as fh:
+                data = json.load(fh)
+                if isinstance(data, dict):
+                    self.help_data = data
+                    self.topics_list.clear()
+                    self.topics_list.addItems(list(self.help_data.keys()))
+                    self.topics_list.setCurrentRow(0)
+                    return
+        except Exception as e:
+            logging.warning('Failed to load help topics file: %s', e)
+
+        # Fallback content when file missing or invalid
+        self.help_data = {
+            "Introduction": "<h1>Introduction</h1><p>Welcome to S-Mapper — a lightweight input remapping tool.</p>",
+            "Usage": "<h1>Usage</h1><p>Create mappings and scope them to a target window title. Use the Ping Log to see ping output.</p>"
+        }
+        self.topics_list.clear()
+        self.topics_list.addItems(list(self.help_data.keys()))
+        self.topics_list.setCurrentRow(0)
+
+    def display_topic(self, current, previous):
+        if current:
+            topic = current.text()
+            self.content_display.setHtml(self.help_data.get(topic, "<p>Help topic not found.</p>"))
+
 class KeyboardListenerThread(QThread):
     """
     A QThread that runs the pynput keyboard listener.
@@ -167,38 +243,61 @@ class PingThread(QThread):
     """
     A QThread that runs a ping command and emits the result.
     """
-    ping_result = pyqtSignal(str)
+    ping_result = pyqtSignal(str, str)
 
     def __init__(self, ip_address):
         super().__init__()
         self.ip_address = ip_address
-        # store the child process to allow an external stop to terminate it
         self._proc = None
         self._stopped = False
 
     def run(self):
+        output = ""
         try:
-            # The command for Windows; use Popen so we can terminate it if
-            # required during shutdown.
             command = ['ping', '-n', '4', self.ip_address]
             self._proc = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)
             )
 
-            output, _ = self._proc.communicate()
-            output = (output or '').lower()
-            if "received = 0" in output or "100% loss" in output:
-                self.ping_result.emit('red')
-            else:
-                self.ping_result.emit('green')
+            try:
+                output, _ = self._proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+                self.ping_result.emit('red', "Ping command timed out.")
+                return
 
-        except Exception as e:
-            print(f"Ping failed: {e}")
-            self.ping_result.emit('red')
+            out = (output or '').lower()
+            # Try to find percent-loss or lost packets in a locale-robust way
+            m_pct = re.search(r'(\d+)%\s*loss', out)
+            m_lost = re.search(r'lost\s*=\s*(\d+)', out)
+            lost_pct = None
+            if m_pct:
+                lost_pct = int(m_pct.group(1))
+            elif m_lost:
+                # If we can't get percent directly, approximate 100% loss -> fail
+                lost = int(m_lost.group(1))
+                lost_pct = 100 if lost > 0 else 0
+
+            color = 'green'
+            if lost_pct is None:
+                # Fallback: look for "0 received" or "received = 0"
+                if re.search(r'received\s*=\s*0', out) or re.search(r'\b0\s+received\b', out):
+                    color = 'red'
+            elif lost_pct >= 100:
+                color = 'red'
+
+            self.ping_result.emit(color, output)
+
+        except Exception:
+            logging.exception("Ping failed")
+            self.ping_result.emit('red', output or f"Ping command failed for {self.ip_address}")
 
     def stop(self):
         """Stop the running ping subprocess if present and request the thread to end."""
@@ -214,7 +313,7 @@ class PingThread(QThread):
         except Exception:
             pass
 
-class KeyMapperApp(QWidget):
+class KeyMapperApp(QMainWindow):
     # Signal used to run mapping actions on the main (GUI) thread. Emitting
     # this from the listener thread queues the action onto the Qt event loop
     # where the single shared keyboard Controller owned by the app will
@@ -222,6 +321,7 @@ class KeyMapperApp(QWidget):
     mapping_action_signal = pyqtSignal(object)
     def __init__(self):
         super().__init__()
+        self.help_window = None
         self.ping_status_label = PingStatusLabel()
         self.mappings_lock = QMutex()
         self.keyboard_controller = keyboard.Controller()
@@ -327,34 +427,39 @@ class KeyMapperApp(QWidget):
             }
         """)
 
-        # Main layout for the entire window
-        main_layout = QVBoxLayout(self)
-        self.setLayout(main_layout)
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout()
+        central_widget.setLayout(main_layout)
+
+        # Create Tab widget
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+
+        # --- Mappings Tab ---
+        self.mappings_tab = QWidget()
+        self.tabs.addTab(self.mappings_tab, "Mappings")
+        mappings_layout = QVBoxLayout(self.mappings_tab)
 
         # Scroll area to contain the main content
-        scroll_area = QScrollArea(self)
+        scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        main_layout.addWidget(scroll_area)
+        mappings_layout.addWidget(scroll_area)
 
         # Container widget for the scroll area's content
         scroll_content = QWidget()
         scroll_area.setWidget(scroll_content)
 
-        # This is the layout that will hold all your UI components
         layout = QVBoxLayout(scroll_content)
         scroll_content.setLayout(layout)
 
-        # --- UI Components ---
-
         layout.addWidget(QLabel("Configure Mouse to Keyboard Mappings"))
 
-        # Mouse Button
         layout.addWidget(QLabel("Mouse Button:"))
         self.mouse_button_combobox = QComboBox()
         self.mouse_button_combobox.addItems(['', 'left', 'right', 'middle', 'x1', 'x2'])
         layout.addWidget(self.mouse_button_combobox)
 
-        # Press Count
         layout.addWidget(QLabel("Number of Presses:"))
         self.press_count_entry = QLineEdit()
         layout.addWidget(self.press_count_entry)
@@ -372,7 +477,6 @@ class KeyMapperApp(QWidget):
         interval_frame.addWidget(self.click_interval_spinbox)
         layout.addLayout(interval_frame)
 
-        # Source Key
         self.source_key_label = QLabel("Source Keyboard Key:")
         layout.addWidget(self.source_key_label)
         self.keyboard_keys = [
@@ -422,7 +526,6 @@ class KeyMapperApp(QWidget):
         layout.addWidget(window_frame)
         self.refresh_window_list()
 
-        # Buttons
         button_layout = QHBoxLayout()
         self.add_button = QPushButton("Add Mapping")
         self.remove_button = QPushButton("Remove Selected")
@@ -434,7 +537,6 @@ class KeyMapperApp(QWidget):
         button_layout.addWidget(self.clear_button)
         layout.addLayout(button_layout)
 
-        # Mappings List
         self.mappings_listbox = QListWidget()
         layout.addWidget(self.mappings_listbox)
 
@@ -511,7 +613,16 @@ class KeyMapperApp(QWidget):
 
         layout.addWidget(ip_monitor_frame)
         
-        # --- Connections ---
+        # --- Ping Log Tab ---
+        ping_log_tab = QWidget()
+        self.tabs.addTab(ping_log_tab, "Ping Log")
+        ping_log_layout = QVBoxLayout(ping_log_tab)
+        
+        self.ping_output_view = QTextEdit()
+        self.ping_output_view.setReadOnly(True)
+        self.ping_output_view.setStyleSheet("background-color: #0d0d0d; color: #d4d4d4; font-family: 'Courier New', Courier, monospace;")
+        ping_log_layout.addWidget(self.ping_output_view)
+        
         self.add_button.clicked.connect(self.add_mapping)
         self.remove_button.clicked.connect(self.remove_mapping)
         self.refresh_button.clicked.connect(self.refresh_window_list)
@@ -522,11 +633,9 @@ class KeyMapperApp(QWidget):
         self.ip_monitor_toggle_button.toggled.connect(self.toggle_ip_monitoring)
         self.click_interval_spinbox.valueChanged.connect(self._on_interval_changed)
         
-        # Clipboard monitoring setup
         self.clipboard = QApplication.clipboard()
         self.clipboard.dataChanged.connect(self.on_clipboard_change)
 
-        # Set initial visibility
         self.update_window_selection_visibility()
 
         # --- System Tray Icon ---
@@ -543,7 +652,7 @@ class KeyMapperApp(QWidget):
         icon = QIcon(resource_path(os.path.join('assets', 'Square44x44Logo.png')))
         if icon.isNull():
             # Icon failed to load. Log a short diagnostic and disable tray usage.
-            print('s_mapper: warning - tray icon failed to load, disabling tray behavior')
+            logging.warning('s_mapper: tray icon failed to load, disabling tray behavior')
             self._tray_available = False
 
         if self._tray_available:
@@ -552,7 +661,7 @@ class KeyMapperApp(QWidget):
                 self.tray_icon.setIcon(icon)
             except Exception:
                 # Guard against unexpected errors setting an icon
-                print('s_mapper: warning - failed to set tray icon')
+                logging.warning('s_mapper: failed to set tray icon')
             self.tray_icon.setToolTip("S-Mapper App")
 
             tray_menu = QMenu()
@@ -568,25 +677,60 @@ class KeyMapperApp(QWidget):
             try:
                 self.tray_icon.setContextMenu(tray_menu)
             except Exception:
-                print('s_mapper: warning - failed to set tray context menu')
+                logging.warning('s_mapper: failed to set tray context menu')
 
-            # show may be a no-op in some environments but calling it is fine
             try:
                 self.tray_icon.show()
             except Exception:
-                # Don't crash if the tray can't be shown
-                print('s_mapper: warning - tray_icon.show() failed')
+                logging.warning('s_mapper: warning - tray_icon.show() failed')
 
-            # Only connect activation handler if we actually have a working tray
             try:
                 self.tray_icon.activated.connect(self.on_tray_icon_activated)
             except Exception:
-                # If connecting fails, degrade gracefully
-                print('s_mapper: warning - failed to connect tray activation')
+                logging.warning('s_mapper: warning - failed to connect tray activation')
         else:
             # No system tray available in this environment — store a lightweight
             # None so other code can detect and fall back.
             self.tray_icon = None
+
+        # Setup toolbar and menu (hideable toolbar + Help button)
+        try:
+            self.setup_toolbar_and_menu()
+        except Exception:
+            logging.warning('Failed to setup toolbar/menu')
+
+    def setup_toolbar_and_menu(self):
+        # Create a toolbar and a View menu entry to toggle it
+        self.toolbar = self.addToolBar("Main Toolbar")
+        self.toolbar.setMovable(False)
+
+        help_action = QAction("Help", self)
+        help_action.triggered.connect(self.show_help_window)
+        self.toolbar.addAction(help_action)
+
+        menu_bar = self.menuBar()
+        view_menu = menu_bar.addMenu("&View")
+        self.toggle_toolbar_action = QAction("Toolbar", self)
+        self.toggle_toolbar_action.setCheckable(True)
+        self.toggle_toolbar_action.setChecked(True)
+        self.toggle_toolbar_action.triggered.connect(self.toggle_toolbar)
+        view_menu.addAction(self.toggle_toolbar_action)
+
+    def toggle_toolbar(self, checked):
+        try:
+            self.toolbar.setVisible(checked)
+        except Exception:
+            pass
+
+    def show_help_window(self):
+        if self.help_window is None:
+            try:
+                self.help_window = HelpWindow()
+            except Exception:
+                logging.exception('Failed to create HelpWindow')
+                return
+        self.help_window.show()
+        self.help_window.activateWindow()
 
     def start_listeners(self):
         self.keyboard_thread = KeyboardListenerThread(self)
@@ -634,36 +778,54 @@ class KeyMapperApp(QWidget):
     def toggle_ip_monitoring(self, checked):
         if checked:
             self.ip_monitor_toggle_button.setText("Stop Monitoring")
-            # Logic to start monitoring can be placed here if needed
         else:
             self.ip_monitor_toggle_button.setText("Start Monitoring")
-            # Logic to stop monitoring can be placed here if needed
 
     def on_clipboard_change(self):
         if not self.ip_monitor_toggle_button.isChecked():
             return
 
         target_window_text = self.ip_monitor_window_entry.text()
-        active_window = gw.getActiveWindow()
+        with self._active_title_lock:
+            active_window_title = self._cached_active_title
 
-        if not target_window_text or not active_window or target_window_text.lower() not in active_window.title.lower():
+        if not target_window_text or not active_window_title or target_window_text.lower() not in active_window_title.lower():
             return
 
         clipboard_text = self.clipboard.text()
-        # Regex to validate an IPv4 address
         ip_pattern = r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$"
         
         if re.match(ip_pattern, clipboard_text):
-            self.ping_status_indicator.setStyleSheet("background-color: #f0ad4e; border-radius: 10px;") # Yellow for "in progress"
+            self.ping_status_indicator.setStyleSheet("background-color: #f0ad4e; border-radius: 10px;")
             cursor_pos = QCursor.pos()
-            self.ping_status_label.show_message("Ping sent...", "#FFA500", cursor_pos) # Orange
+            self.ping_status_label.show_message("Ping sent...", "#FFA500", cursor_pos)
             self.mouse_thread.mouse_moved.connect(self.update_label_position)
             pt = PingThread(clipboard_text)
-            pt.ping_result.connect(self.update_ping_indicator)
-            # Track active ping threads to allow orderly shutdown.
+            pt.ping_result.connect(self.handle_ping_result)
             self._ping_threads.add(pt)
             pt.finished.connect(lambda: self._ping_threads.discard(pt))
             pt.start()
+
+    def handle_ping_result(self, color, output):
+        self.update_ping_indicator(color)
+        
+        header = f"--- Ping results for {self.clipboard.text()} ---"
+        escaped_output = html.escape(output)
+
+        # Prepend a newline if there's already content
+        leading_br = "<br>" if self.ping_output_view.toPlainText() else ""
+        
+        html_content = (
+            f'{leading_br}<div style="color: {color}; font-family: \'Courier New\', Courier, monospace;">'
+            f'<b>{header}</b><br>'
+            f'<pre>{escaped_output}</pre>'
+            '</div>'
+        )
+
+        cursor = self.ping_output_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.ping_output_view.setTextCursor(cursor)
+        self.ping_output_view.insertHtml(html_content)
 
     def update_ping_indicator(self, color):
         self.ping_status_indicator.setStyleSheet(f"background-color: {color}; border-radius: 10px;")
@@ -673,9 +835,7 @@ class KeyMapperApp(QWidget):
         else:
             self.ping_status_label.show_message("Ping succeeded", "green", cursor_pos)
 
-        # Hide floating label and disconnect listener after 1 second
         QTimer.singleShot(1000, self.hide_ping_status_and_disconnect)
-        # Reset indicator light after 5 seconds
         QTimer.singleShot(5000, lambda: self.ping_status_indicator.setStyleSheet("background-color: #555; border-radius: 10px;"))
 
     def hide_ping_status_and_disconnect(self):
@@ -794,21 +954,47 @@ class KeyMapperApp(QWidget):
         else:
             QMessageBox.warning(self, "Input Error", "Please select a trigger key or button.")
 
+    def _add_mapping_details(self, details):
+        """Adds a validated mapping details dictionary to the central store."""
+        self.mappings_lock.lock()
+        try:
+            target_window = details.get('window_title', '')
+            if not target_window:
+                return
+
+            mapping_id = f"Mapping {self.mapping_counter}"
+            self.mapping_counter += 1
+
+            if target_window not in self.mappings:
+                self.mappings[target_window] = {}
+
+            self.mappings[target_window][mapping_id] = details
+            self.mapping_ids.append(mapping_id)
+            self.update_mappings_display()
+        finally:
+            self.mappings_lock.unlock()
+        
+        if self._kbd_available and getattr(self, '_kbd_enabled', False):
+            try:
+                self._refresh_keyboard_hooks()
+            except Exception:
+                pass
+        self.clear()
+
     def add_mouse_mapping(self):
-        locker = QMutexLocker(self.mappings_lock)
-        mouse_button = self.mouse_button_combobox.currentText()
+        mouse_button = self.mouse_button_combobox.currentText().lower().strip()
         try:
             press_count = int(self.press_count_entry.text())
         except ValueError:
             QMessageBox.warning(self, "Input Error", "Invalid press count. Please enter a number.")
             return
         
-        keyboard_button = self.target_keyboard_combobox.currentText()
+        keyboard_button = self.target_keyboard_combobox.currentText().lower().strip()
 
         if self.window_selection_radio1.isChecked():
-            target_window = self.window_selection_entry.text()
+            target_window = self.window_selection_entry.text().lower().strip()
         else:
-            target_window = self.window_selection_combobox.currentText()
+            target_window = self.window_selection_combobox.currentText().lower().strip()
 
         if not all([mouse_button, keyboard_button, target_window]):
             QMessageBox.warning(self, "Input Error", "Please fill all required fields.")
@@ -818,41 +1004,26 @@ class KeyMapperApp(QWidget):
         if modifier_key:
             keyboard_button = f"{modifier_key} + {keyboard_button}"
 
-        mapping_id = f"Mapping {self.mapping_counter}"
-        self.mapping_counter += 1
-
-        if target_window not in self.mappings:
-            self.mappings[target_window] = {}
-
         final_key = keyboard_button
         if keyboard_button.startswith('f') and keyboard_button[1:].isdigit():
             final_key = getattr(Key, keyboard_button.lower(), keyboard_button)
 
-        self.mappings[target_window][mapping_id] = {
+        details = {
             'mouse_button': mouse_button,
             'press_count': press_count,
             'keyboard_button': final_key,
             'window_title': target_window
         }
-        self.mapping_ids.append(mapping_id)
-        self.update_mappings_display()
-        # Keep low-level hooks in sync when present
-        if self._kbd_available and getattr(self, '_kbd_enabled', False):
-            try:
-                self._refresh_keyboard_hooks()
-            except Exception:
-                pass
-        self.clear()
+        self._add_mapping_details(details)
 
     def add_keyboard_mapping(self):
-        locker = QMutexLocker(self.mappings_lock)
-        source_key = self.source_keyboard_combobox.currentText()
-        target_key = self.target_keyboard_combobox.currentText()
+        source_key = self.source_keyboard_combobox.currentText().lower().strip()
+        target_key = self.target_keyboard_combobox.currentText().lower().strip()
 
         if self.window_selection_radio1.isChecked():
-            target_window = self.window_selection_entry.text()
+            target_window = self.window_selection_entry.text().lower().strip()
         else:
-            target_window = self.window_selection_combobox.currentText()
+            target_window = self.window_selection_combobox.currentText().lower().strip()
 
         if not all([source_key, target_key, target_window]):
             QMessageBox.warning(self, "Input Error", "Please fill all required fields.")
@@ -861,42 +1032,34 @@ class KeyMapperApp(QWidget):
         modifier_key = self.modifier_key_combobox.currentText()
         if modifier_key:
             target_key = f"{modifier_key} + {target_key}"
-
-        mapping_id = f"Mapping {self.mapping_counter}"
-        self.mapping_counter += 1
-
-        if target_window not in self.mappings:
-            self.mappings[target_window] = {}
         
-        self.mappings[target_window][mapping_id] = {
+        details = {
             'source_key': source_key,
             'target_key': target_key,
             'window_title': target_window
         }
-        self.mapping_ids.append(mapping_id)
-        self.update_mappings_display()
-        if self._kbd_available and getattr(self, '_kbd_enabled', False):
-            try:
-                self._refresh_keyboard_hooks()
-            except Exception:
-                pass
-        self.clear()
+        self._add_mapping_details(details)
         
     def remove_mapping(self):
-        locker = QMutexLocker(self.mappings_lock)
         selected_item = self.mappings_listbox.currentItem()
         if not selected_item:
             return
         
         selected_index = self.mappings_listbox.row(selected_item)
-        mapping_id = self.mapping_ids.pop(selected_index)
-
-        for target_window in self.mappings:
-            if mapping_id in self.mappings[target_window]:
-                del self.mappings[target_window][mapping_id]
-                break
         
-        self.update_mappings_display()
+        self.mappings_lock.lock()
+        try:
+            mapping_id = self.mapping_ids.pop(selected_index)
+
+            for target_window in self.mappings:
+                if mapping_id in self.mappings[target_window]:
+                    del self.mappings[target_window][mapping_id]
+                    break
+            
+            self.update_mappings_display()
+        finally:
+            self.mappings_lock.unlock()
+
         # Update low-level hooks if suppression is enabled
         if self._kbd_available and getattr(self, '_kbd_enabled', False):
             try:
@@ -951,17 +1114,17 @@ class KeyMapperApp(QWidget):
                                 2000
                             )
                         except Exception:
-                            print('s_mapper: warning - tray_icon.showMessage() failed')
+                            logging.warning('s_mapper: tray_icon.showMessage() failed')
                     except Exception:
                         # If hiding fails for some reason, avoid leaving the
                         # application invisible with no recovery path — keep it
                         # visible instead.
-                        print('s_mapper: warning - hide() failed while minimizing; leaving window visible')
+                        logging.warning('s_mapper: hide() failed while minimizing; leaving window visible')
                 else:
                     # If the system tray is not available, do not hide the window
                     # when minimized. This provides a safe fallback for environments
                     # where the tray is not present (e.g., MSIX/AppContainer).
-                    print('s_mapper: system tray unavailable - not hiding window on minimize')
+                    logging.info('s_mapper: system tray unavailable - not hiding window on minimize')
         # In some test or shim scenarios the instance we bound the method to
         # won't be a true QWidget instance and calling super().changeEvent
         # will raise a TypeError. Guard this call so tests and thin stubs can
@@ -972,40 +1135,52 @@ class KeyMapperApp(QWidget):
             pass
 
     def on_press(self, key):
-        locker = QMutexLocker(self.mappings_lock)
+        self.mappings_lock.lock()
         try:
-            # When using the low-level keyboard hooks we register separate
-            # handlers and suppress the original event, so skip the
-            # pynput on_press mapping behavior to avoid duplication.
             if self._kbd_available and getattr(self, '_kbd_enabled', False):
                 return
-            pressed_key = key.char if isinstance(key, keyboard.KeyCode) else key.name
-            current_window = gw.getActiveWindow()
-            if not pressed_key or not current_window:
+
+            pressed_key = None
+            if isinstance(key, keyboard.KeyCode):
+                pressed_key = getattr(key, 'char', None)
+            else:
+                pressed_key = getattr(key, 'name', None)
+
+            if not pressed_key:
                 return
 
-            current_window_title = current_window.title
-            
+            pressed_key = pressed_key.lower().strip()
+
+            with self._active_title_lock:
+                current_title = self._cached_active_title
+
+            if not current_title:
+                return
+
             for window_title, mappings in self.mappings.items():
-                if window_title in current_window_title:
+                if not window_title:
+                    continue
+                if window_title.strip().lower() in current_title:
                     for details in mappings.values():
-                        if 'source_key' in details and details['source_key'] == pressed_key:
+                        if details.get('source_key', '').lower().strip() == pressed_key:
                             self.mapping_action_signal.emit(details['target_key'])
                             return
-        except (AttributeError, KeyError, ValueError):
-            pass
+        except Exception:
+            logging.exception("on_press")
+        finally:
+            self.mappings_lock.unlock()
 
     def on_click(self, x, y, button, pressed):
-        locker = QMutexLocker(self.mappings_lock)
         if not pressed:
-            # We only care about press events
             return
 
-        active_window = gw.getActiveWindow()
-        if not active_window:
+        with self._active_title_lock:
+            target_window_title = self._cached_active_title
+
+        if not target_window_title:
             return
 
-        button_name = button.name
+        button_name = button.name.lower().strip()
         current_time = time.time()
 
         self.click_counts.setdefault(button_name, 0)
@@ -1017,53 +1192,43 @@ class KeyMapperApp(QWidget):
         self.click_counts[button_name] += 1
         self.last_click_time[button_name] = current_time
 
-        target_window_title = active_window.title
-
-        # Find a matching mapping while holding the lock briefly, but don't
-        # perform the keyboard action inside the listener thread to avoid
-        # blocking the mouse listener. Instead collect action details and
-        # run them on a background thread.
         action_to_run = None
 
-        for partial_title, mappings in self.mappings.items():
-            if partial_title in target_window_title:
-                for details in mappings.values():
-                    if 'mouse_button' not in details:
-                        continue
+        self.mappings_lock.lock()
+        try:
+            for partial_title, mappings in self.mappings.items():
+                if partial_title.strip().lower() in target_window_title:
+                    for details in mappings.values():
+                        if 'mouse_button' not in details:
+                            continue
 
-                    if (details['mouse_button'] == button_name and
-                            details['press_count'] == self.click_counts[button_name]):
+                        if (details['mouse_button'].lower().strip() == button_name and
+                                details['press_count'] == self.click_counts[button_name]):
 
-                        # Reset click counter inside the lock quickly so any
-                        # subsequent clicks don't interfere.
-                        self.click_counts[button_name] = 0
-                        action_to_run = details['keyboard_button']
+                            self.click_counts[button_name] = 0
+                            action_to_run = details['keyboard_button']
+                            break
+
+                    if action_to_run:
                         break
-
-                if action_to_run:
-                    break
-
-        # release the lock (QMutexLocker destructor on function exit)
+        finally:
+            self.mappings_lock.unlock()
 
         if not action_to_run:
             return
 
-        # Run the actual keyboard press on a separate, short-lived thread
-        # so we don't block the mouse listener.
-        # Use Qt signal to queue action to main thread. This avoids
-        # the timing/focus problems that can happen when actions run in
-        # independent worker threads, and keeps the listener non-blocking.
         self.mapping_action_signal.emit(action_to_run)
 
     def _get_config_filepath(self):
         """
         Returns the platform-specific, user-writable path for the mappings.ini file.
         """
-        # Use LOCALAPPDATA for Windows, which is the correct place for user-specific config.
         app_data_path = os.environ.get('LOCALAPPDATA')
         if not app_data_path:
-            # Fallback for unusual cases, though LOCALAPPDATA is standard on Windows.
-            return 'mappings.ini'
+            try:
+                app_data_path = os.path.expanduser(r"~\AppData\Local")
+            except Exception:
+                return 'mappings.ini'
 
         config_dir = os.path.join(app_data_path, 'S-Mapper')
         os.makedirs(config_dir, exist_ok=True)
@@ -1073,11 +1238,13 @@ class KeyMapperApp(QWidget):
         config = configparser.ConfigParser()
         config.optionxform = str
         
-        locker = QMutexLocker(self.mappings_lock)
-
-        all_mappings = {}
-        for mappings_by_window in self.mappings.values():
-            all_mappings.update(mappings_by_window)
+        self.mappings_lock.lock()
+        try:
+            all_mappings = {}
+            for mappings_by_window in self.mappings.values():
+                all_mappings.update(mappings_by_window)
+        finally:
+            self.mappings_lock.unlock()
 
         # Persist application settings in a dedicated section so the
         # click interval is preserved between runs.
@@ -1107,42 +1274,6 @@ class KeyMapperApp(QWidget):
         with open(self._get_config_filepath(), 'w') as configfile:
             config.write(configfile)
 
-    def _run_keyboard_action_worker(self, keyboard_button):
-        """
-        Worker used to execute keyboard press/release for a mapping off the
-        listener thread. Using a local Controller instance is safer and keeps
-        the listener responsive.
-        """
-        try:
-            # Use a dedicated Controller instance in this thread
-            local_controller = keyboard.Controller()
-
-            # Convert Key objects to their name string if necessary
-            if isinstance(keyboard_button, Key):
-                kb_button_str = keyboard_button.name
-            else:
-                kb_button_str = keyboard_button
-
-            # Parse modifiers and the main key
-            parts = kb_button_str.split(' + ')
-            key_to_press_str = parts[-1].strip()
-            modifiers_str = [p.strip() for p in parts[:-1] if p.strip()]
-
-            key_to_press = getattr(Key, key_to_press_str, key_to_press_str)
-            modifier_keys = [getattr(Key, m) for m in modifiers_str]
-
-            if modifier_keys:
-                with local_controller.pressed(*modifier_keys):
-                    local_controller.press(key_to_press)
-                    local_controller.release(key_to_press)
-            else:
-                local_controller.press(key_to_press)
-                local_controller.release(key_to_press)
-
-        except Exception as e:
-            # Keep logs minimal to avoid spamming the listener thread.
-            print(f"Mapping action failed: {e}")
-
     def _handle_mapping_action(self, keyboard_button):
         """
         Slot executed on the GUI thread (via mapping_action_signal) that
@@ -1150,19 +1281,27 @@ class KeyMapperApp(QWidget):
         key injection consistent with the app's main controller.
         """
         try:
-            # Use the shared controller already created by the app
-            kb_button = keyboard_button
-            if isinstance(kb_button, Key):
-                kb_button_str = kb_button.name
-            else:
-                kb_button_str = kb_button
+            kb_button_str = keyboard_button if isinstance(keyboard_button, str) else keyboard_button.name
+            
+            parts = [p.strip() for p in kb_button_str.replace(' + ', '+').split('+')]
+            main_key = parts[-1]
+            modifiers = [m.lower() for m in parts[:-1] if m]
+            modifier_keys = []
 
-            parts = kb_button_str.split(' + ')
-            key_to_press_str = parts[-1].strip()
-            modifiers_str = [p.strip() for p in parts[:-1] if p.strip()]
+            for m in modifiers:
+                if m in ('ctrl', 'control'):
+                    modifier_keys.append(Key.ctrl)
+                elif m == 'shift':
+                    modifier_keys.append(Key.shift)
+                elif m == 'alt':
+                    modifier_keys.append(Key.alt)
+                elif m in ('win', 'windows', 'cmd', 'meta'):
+                    modifier_keys.append(Key.cmd)
+                else:
+                    logging.warning(f"Unknown modifier key: {m}")
 
-            key_to_press = getattr(Key, key_to_press_str, key_to_press_str)
-            modifier_keys = [getattr(Key, m) for m in modifiers_str]
+            modifier_keys = [m for m in modifier_keys if m is not None]
+            key_to_press = getattr(Key, main_key, main_key)
 
             if modifier_keys:
                 with self.keyboard_controller.pressed(*modifier_keys):
@@ -1173,7 +1312,7 @@ class KeyMapperApp(QWidget):
                 self.keyboard_controller.release(key_to_press)
 
         except Exception as e:
-            print(f"Mapping action failed (main thread): {e}")
+            logging.exception(f"Mapping action failed (main thread): {e}")
 
     def load_mappings_from_config(self):
         config = configparser.ConfigParser()
@@ -1182,10 +1321,9 @@ class KeyMapperApp(QWidget):
         config_path = self._get_config_filepath()
         if not os.path.exists(config_path):
             try:
-                # Create an empty file so the app can save to it later.
                 with open(config_path, 'w') as configfile:
                     pass
-                return # Stop here since there's nothing to load
+                return
             except IOError as e:
                 QMessageBox.critical(self, "File Creation Error", f"Failed to create {config_path}: {e}")
                 return
@@ -1193,56 +1331,59 @@ class KeyMapperApp(QWidget):
         config.read(config_path)
         highest_mapping_number = 0
 
-        locker = QMutexLocker(self.mappings_lock)
-        self.mappings.clear()
-        self.mapping_ids.clear()
+        self.mappings_lock.lock()
+        try:
+            self.mappings.clear()
+            self.mapping_ids.clear()
 
-        for section_name in config.sections():
-            if section_name == 'DEFAULT':
-                continue
-
-            try:
-                mapping_id = section_name
-                details = {}
-                config_section = config[section_name]
-                
-                mapping_type = config_section.get('type')
-                target_window = config_section.get('window_title', '')
-                details['window_title'] = target_window
-
-                if mapping_type == 'mouse':
-                    details['mouse_button'] = config_section.get('mouse_button')
-                    details['press_count'] = config_section.getint('press_count')
-                    kb_button_str = config_section.get('target_key')
-                    
-                    if kb_button_str.startswith('Key.'):
-                        key_name = kb_button_str.split('.', 1)[1]
-                        details['keyboard_button'] = getattr(Key, key_name, key_name)
-                    else:
-                        details['keyboard_button'] = kb_button_str
-
-                elif mapping_type == 'keyboard':
-                    details['source_key'] = config_section.get('source_key')
-                    details['target_key'] = config_section.get('target_key')
-
-                else:
+            for section_name in config.sections():
+                if section_name in ['DEFAULT', 'Settings']:
                     continue
 
-                if target_window not in self.mappings:
-                    self.mappings[target_window] = {}
-                
-                self.mappings[target_window][mapping_id] = details
-                self.mapping_ids.append(mapping_id)
+                try:
+                    mapping_id = section_name
+                    details = {}
+                    config_section = config[section_name]
+                    
+                    mapping_type = config_section.get('type')
+                    target_window = config_section.get('window_title', '')
+                    details['window_title'] = target_window
 
-                num_part = mapping_id.split()[-1]
-                if num_part.isdigit():
-                    mapping_number = int(num_part)
-                    if mapping_number > highest_mapping_number:
-                        highest_mapping_number = mapping_number
-            
-            except (configparser.NoOptionError, ValueError, IndexError) as e:
-                print(f"Skipping malformed or incomplete section {section_name}: {e}")
-                continue
+                    if mapping_type == 'mouse':
+                        details['mouse_button'] = config_section.get('mouse_button')
+                        details['press_count'] = config_section.getint('press_count')
+                        kb_button_str = config_section.get('target_key')
+                        
+                        if kb_button_str.startswith('Key.'):
+                            key_name = kb_button_str.split('.', 1)[1]
+                            details['keyboard_button'] = getattr(Key, key_name, key_name)
+                        else:
+                            details['keyboard_button'] = kb_button_str
+
+                    elif mapping_type == 'keyboard':
+                        details['source_key'] = config_section.get('source_key')
+                        details['target_key'] = config_section.get('target_key')
+
+                    else:
+                        continue
+
+                    if target_window not in self.mappings:
+                        self.mappings[target_window] = {}
+                    
+                    self.mappings[target_window][mapping_id] = details
+                    self.mapping_ids.append(mapping_id)
+
+                    num_part = mapping_id.split()[-1]
+                    if num_part.isdigit():
+                        mapping_number = int(num_part)
+                        if mapping_number > highest_mapping_number:
+                            highest_mapping_number = mapping_number
+                
+                except (configparser.NoOptionError, ValueError, IndexError) as e:
+                    logging.warning(f"Skipping malformed or incomplete section {section_name}: {e}")
+                    continue
+        finally:
+            self.mappings_lock.unlock()
 
         self.mapping_counter = highest_mapping_number + 1
         self.update_mappings_display()
@@ -1291,14 +1432,18 @@ class KeyMapperApp(QWidget):
         # so callbacks don't need to iterate the entire mapping set each time.
         source_keys = set()
         self._source_index.clear()
-        for mappings in self.mappings.values():
-            for details in mappings.values():
-                if 'source_key' in details and details['source_key']:
-                    sk = details['source_key']
-                    source_keys.add(sk)
-                    self._source_index.setdefault(sk, []).append(
-                        (details.get('window_title', ''), details.get('target_key'))
-                    )
+        self.mappings_lock.lock()
+        try:
+            for mappings in self.mappings.values():
+                for details in mappings.values():
+                    if 'source_key' in details and details['source_key']:
+                        sk = details['source_key']
+                        source_keys.add(sk)
+                        self._source_index.setdefault(sk, []).append(
+                            (details.get('window_title', ''), details.get('target_key'))
+                        )
+        finally:
+            self.mappings_lock.unlock()
 
         # After rebuilding the index, update hooks to match the current
         # active window title (so only keys targeted to the current
@@ -1468,20 +1613,17 @@ class KeyMapperApp(QWidget):
 
 
     def closeEvent(self, event):
-        # Persist settings first
         try:
             self.save_mappings_to_config()
         except Exception:
             pass
 
-        # Stop and wait for ping threads (best effort)
         try:
             for pt in list(getattr(self, '_ping_threads', [])):
                 try:
                     pt.stop()
                 except Exception:
                     pass
-            # Give ping threads a moment to exit
             for pt in list(getattr(self, '_ping_threads', [])):
                 try:
                     pt.wait(1000)
@@ -1514,24 +1656,21 @@ class KeyMapperApp(QWidget):
                     except Exception:
                         pass
             except Exception:
-                print(f's_mapper: warning - failed to stop/kill {name}')
+                logging.warning(f's_mapper: failed to stop/kill {name}')
 
         _stop_and_wait(getattr(self, 'keyboard_thread', None), 'keyboard_thread')
         _stop_and_wait(getattr(self, 'mouse_thread', None), 'mouse_thread')
 
-        # Stop periodic timers
         try:
             self._active_title_timer.stop()
         except Exception:
             pass
 
-        # Remove any low-level hooks
         try:
             self._unhook_all_keyboard_hooks()
         except Exception:
             pass
 
-        # Remove tray icon if present
         try:
             if getattr(self, 'tray_icon', None):
                 try:
@@ -1573,6 +1712,17 @@ class KeyMapperApp(QWidget):
         event.accept()
 
 if __name__ == "__main__":
+    # Configure console logging for INFO and up
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    # Configure file logging for ERROR and up
+    log_file_path = get_log_filepath()
+    file_handler = logging.FileHandler(log_file_path)
+    file_handler.setLevel(logging.ERROR)
+    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logging.getLogger('').addHandler(file_handler)
+
     # Enable High-DPI scaling before creating the QApplication
     # This is the most reliable method across Qt versions
     os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
