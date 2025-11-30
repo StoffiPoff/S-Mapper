@@ -1,4 +1,11 @@
 # An improved script to build the MSIX package for S-Mapper
+# Optional variant parameter: full, lite, or both
+param(
+    [ValidateSet('full','lite','both')]
+    [string]$Variant = 'both',
+    [switch]$Parallel,        # Build PyInstaller variants in parallel
+    [switch]$ForceRebuild     # Rebuild even if a dist artifact exists
+)
 
 # --- Configuration ---
 $AppName = "S-Mapper"
@@ -33,10 +40,6 @@ function ReEncode-Manifest {
 }
 
 # Optional variant parameter: full, lite, or both
-param(
-    [ValidateSet('full','lite','both')]
-    [string]$Variant = 'both'
-)
 
 # Allow overriding the variant with an environment variable (useful when
 # calling the script in contexts where parameters don't bind properly).
@@ -74,19 +77,59 @@ if (-not (Test-Path -Path $InstallerPath)) {
 New-Item -Path $BuildPath -ItemType Directory
 New-Item -Path $AppxPath -ItemType Directory
 
+## Start timer so we can measure elapsed build time
+$sw = [Diagnostics.Stopwatch]::StartNew()
+
 # 3. Build executables depending on the desired variant
+function ShouldBuildExe {
+    param([string]$exeName)
+    if ($ForceRebuild) { return $true }
+    $target = Join-Path -Path $ScriptPath -ChildPath (Join-Path 'dist' $exeName)
+    return (-not (Test-Path -Path $target))
+}
+
+$procs = @()
 if ($Variant -eq 'full' -or $Variant -eq 'both') {
-    Write-Host "Building full variant (includes keyboard if present in venv)" -ForegroundColor Cyan
-    # Ensure the assets folder is embedded into the onefile binary so icons
-    # are available internally and don't rely on an external folder at runtime.
-    & $pyInstallerPath --noconfirm --onefile --windowed --name s_mapper_full --icon "assets\Square150x150Logo.png" --add-data "assets;assets" "s_mapper.py"
-    if ($LASTEXITCODE -ne 0) { Write-Host "PyInstaller failed to build full variant" -ForegroundColor Red; exit 1 }
+    if (ShouldBuildExe 's_mapper_full.exe') {
+        Write-Host "Building full variant (includes keyboard if present in venv)" -ForegroundColor Cyan
+        $fullArgs = @('--noconfirm','--onefile','--windowed','--name','s_mapper_full','--icon','assets\Square150x150Logo.png','--add-data','assets;assets','s_mapper\app.py')
+        if ($Parallel.IsPresent -and ($Variant -eq 'both')) {
+            $p = Start-Process -FilePath $pyInstallerPath -ArgumentList $fullArgs -PassThru
+            $procs += $p
+        } else {
+            $p = Start-Process -FilePath $pyInstallerPath -ArgumentList $fullArgs -NoNewWindow -Wait -PassThru
+            if ($p.ExitCode -ne 0) { Write-Host "PyInstaller failed to build full variant" -ForegroundColor Red; exit 1 }
+        }
+    } else {
+        Write-Host "Skipping full variant - dist/s_mapper_full.exe already exists (use -ForceRebuild to override)" -ForegroundColor Yellow
+    }
 }
 
 if ($Variant -eq 'lite' -or $Variant -eq 'both') {
-    Write-Host "Building lite variant (explicitly excludes 'keyboard' to avoid low-level suppression dependency)" -ForegroundColor Cyan
-    & $pyInstallerPath --noconfirm --onefile --windowed --name s_mapper_lite --icon "assets\Square150x150Logo.png" --add-data "assets;assets" --exclude-module keyboard "s_mapper.py"
-    if ($LASTEXITCODE -ne 0) { Write-Host "PyInstaller failed to build lite variant" -ForegroundColor Red; exit 1 }
+    if (ShouldBuildExe 's_mapper_lite.exe') {
+        Write-Host "Building lite variant (explicitly excludes 'keyboard' to avoid low-level suppression dependency)" -ForegroundColor Cyan
+        $liteArgs = @('--noconfirm','--onefile','--windowed','--name','s_mapper_lite','--icon','assets\Square150x150Logo.png','--add-data','assets;assets','--exclude-module','keyboard','s_mapper\app.py')
+        if ($Parallel.IsPresent -and ($Variant -eq 'both')) {
+            $p = Start-Process -FilePath $pyInstallerPath -ArgumentList $liteArgs -PassThru
+            $procs += $p
+        } else {
+            $p = Start-Process -FilePath $pyInstallerPath -ArgumentList $liteArgs -NoNewWindow -Wait -PassThru
+            if ($p.ExitCode -ne 0) { Write-Host "PyInstaller failed to build lite variant" -ForegroundColor Red; exit 1 }
+        }
+    } else {
+        Write-Host "Skipping lite variant - dist/s_mapper_lite.exe already exists (use -ForceRebuild to override)" -ForegroundColor Yellow
+    }
+}
+
+# If we launched parallel processes, wait for them and check status
+if ($procs.Count -gt 0) {
+    $ids = $procs | ForEach-Object { $_.Id }
+    Wait-Process -Id $ids
+    foreach ($p in $procs) {
+        # refresh process info
+        $p.Refresh()
+        if ($p.ExitCode -ne 0) { Write-Host "One of the parallel builds failed (exit $($p.ExitCode))" -ForegroundColor Red; exit 1 }
+    }
 }
 
 # 4. Clean and re-encode the AppxManifest.xml to be safe
@@ -126,13 +169,9 @@ function Prepare-ManifestCopy {
 # 5. Copy the executable and assets to the appx folder
 # 5. Build two variants using PyInstaller
 
-Write-Host "Building full variant (includes keyboard if present in venv)" -ForegroundColor Cyan
-& $pyInstallerPath --noconfirm --onefile --windowed --name s_mapper_full --icon "assets\Square150x150Logo.png" --add-data "assets;assets" "s_mapper.py"
-if ($LASTEXITCODE -ne 0) { Write-Host "PyInstaller failed to build full variant" -ForegroundColor Red; exit 1 }
-
-Write-Host "Building lite variant (explicitly excludes 'keyboard' to avoid low-level suppression dependency)" -ForegroundColor Cyan
-& $pyInstallerPath --noconfirm --onefile --windowed --name s_mapper_lite --icon "assets\Square150x150Logo.png" --add-data "assets;assets" --exclude-module keyboard "s_mapper.py"
-if ($LASTEXITCODE -ne 0) { Write-Host "PyInstaller failed to build lite variant" -ForegroundColor Red; exit 1 }
+# NOTE: the PyInstaller calls were already executed above (depending on $Variant).
+# This section used to build binaries again unconditionally and caused the build
+# to run twice. Those duplicate invocations have been removed to avoid extra time.
 
 # 6. Create separate appx folders for full + lite and copy required files
 $AppxFull = Join-Path -Path $AppxPath -ChildPath "full"
@@ -174,3 +213,5 @@ if ($Variant -eq 'lite' -or $Variant -eq 'both') {
 # signtool sign /a /fd SHA256 /f "my_certificate.pfx" /p "my_password" "$InstallerPath\$PackageName.msix"
 
 Write-Host "MSIX packages built (variant: $Variant). See $InstallerPath" -ForegroundColor Green
+$sw.Stop()
+Write-Host "Total build time: $($sw.Elapsed.TotalSeconds) seconds" -ForegroundColor Green

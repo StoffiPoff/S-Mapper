@@ -54,6 +54,7 @@ open-key-mapper-app.bat
 *~
 microsoft.*
 _internal*
+.old*
 
 # Pytest cache
 .pytest_cache/

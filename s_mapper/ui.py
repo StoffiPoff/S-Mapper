@@ -1,31 +1,24 @@
 import sys
 import os
 import time
-import json
 import configparser
 import re
-import subprocess
 import logging
 import html
 
-
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
     QLineEdit, QPushButton, QListWidget, QRadioButton, QFrame, QMessageBox,
     QSystemTrayIcon, QMenu, QDoubleSpinBox, QScrollArea, QTabWidget, QTextEdit,
-    QMainWindow, QToolBar, QTextBrowser
+    QMainWindow
 )
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QMutex, QMutexLocker, QTimer, QEvent
+from PyQt6.QtCore import pyqtSignal, Qt, QMutex, QMutexLocker, QTimer, QEvent
 from PyQt6.QtGui import QCursor, QIcon, QAction, QTextCursor
-from pynput import mouse, keyboard
+from pynput import keyboard
 import threading
 try:
     import pygetwindow as gw
 except Exception:
-    # When running tests or in stripped environments the optional
-    # pygetwindow package may not be present. Provide a small shim so
-    # the rest of the module can import and tests can run without
-    # importing the optional dependency.
     class _GWStub:
         @staticmethod
         def getActiveWindow():
@@ -38,8 +31,12 @@ except Exception:
     gw = _GWStub()
 from pynput.keyboard import Key
 
+from .utils import is_running_as_admin, resource_path
+from .threads import KeyboardListenerThread, ActiveWindowEventThread, MouseListenerThread, PingThread
+from .widgets import HelpWindow, PingStatusLabel
+
 # Optional low-level keyboard interception via the 'keyboard' package.
-# We import lazily and safely since the user may not have it installed.
+# Import at module-level so all methods in this module can reference `kbd`.
 try:
     import keyboard as kbd  # type: ignore
     _KBD_AVAILABLE = True
@@ -48,280 +45,9 @@ except Exception:
     _KBD_AVAILABLE = False
 
 
-def _check_admin_windows() -> bool:
-    """Return True if the current process is running elevated (Windows).
-
-    This uses ctypes.windll.shell32.IsUserAnAdmin which returns a non-zero
-    value when running elevated. Wrap in try/except to avoid import-time
-    errors in environments where ctypes/win32 APIs are restricted.
-    """
-    try:
-        import ctypes
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-
-def _check_admin_unix() -> bool:
-    """Return True if the current process is running as root on UNIX-like OSes."""
-    try:
-        return os.geteuid() == 0
-    except Exception:
-        return False
-
-
-def is_running_as_admin() -> bool:
-    """Cross-platform check whether the current process is elevated/privileged.
-
-    Returns True on Windows when running elevated, and True on Unix when
-    running as root. Fails safe and returns False on unexpected errors.
-    """
-    if os.name == 'nt':
-        return _check_admin_windows()
-    return _check_admin_unix()
-
-def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
-    try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
-        base_path = sys._MEIPASS
-    except Exception:
-        # Fall back to the directory containing this file which is the
-        # correct resource location during development (avoids relying
-        # on the current working directory which can vary).
-        base_path = os.path.abspath(os.path.dirname(__file__))
-
-    return os.path.join(base_path, relative_path)
-
-def get_log_filepath():
-    """
-    Returns the platform-specific, user-writable path for the error.log file.
-    """
-    try:
-        app_data_path = os.environ.get('LOCALAPPDATA')
-        if not app_data_path:
-            app_data_path = os.path.expanduser(r"~\AppData\Local")
-
-        log_dir = os.path.join(app_data_path, 'S-Mapper')
-        os.makedirs(log_dir, exist_ok=True)
-        return os.path.join(log_dir, 'error.log')
-    except Exception:
-        return 'error.log'
-
-class HelpWindow(QWidget):
-    """Simple help viewer with a list of topics and an HTML content pane."""
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("S-Mapper Help")
-        self.setWindowIcon(QIcon(resource_path(os.path.join('assets', 'Square44x44Logo.png'))))
-        self.setGeometry(200, 200, 700, 500)
-        self.initUI()
-
-    def initUI(self):
-        self.setStyleSheet("""
-            QWidget {
-                background-color: #1e1e1e;
-                color: #d4d4d4;
-                font-size: 10pt;
-            }
-            QListWidget {
-                background-color: #252526;
-                border: 1px solid #3a3d41;
-            }
-            QTextBrowser {
-                background-color: #252526;
-                border: 1px solid #3a3d41;
-            }
-        """)
-        layout = QHBoxLayout(self)
-
-        self.topics_list = QListWidget()
-        self.topics_list.setMaximumWidth(220)
-        layout.addWidget(self.topics_list)
-
-        self.content_display = QTextBrowser()
-        self.content_display.setOpenExternalLinks(True)
-        layout.addWidget(self.content_display)
-
-        self.topics_list.currentItemChanged.connect(self.display_topic)
-        self.populate_help()
-
-    def populate_help(self):
-        # Prefer loading the help file from the assets folder, fallback to a
-        # tiny built-in help if that fails for whatever reason.
-        try:
-            path = resource_path(os.path.join('assets', 'help_topics.json'))
-            with open(path, 'r', encoding='utf-8') as fh:
-                data = json.load(fh)
-                if isinstance(data, dict):
-                    self.help_data = data
-                    self.topics_list.clear()
-                    self.topics_list.addItems(list(self.help_data.keys()))
-                    self.topics_list.setCurrentRow(0)
-                    return
-        except Exception as e:
-            logging.warning('Failed to load help topics file: %s', e)
-
-        # Fallback content when file missing or invalid
-        self.help_data = {
-            "Introduction": "<h1>Introduction</h1><p>Welcome to S-Mapper — a lightweight input remapping tool.</p>",
-            "Usage": "<h1>Usage</h1><p>Create mappings and scope them to a target window title. Use the Ping Log to see ping output.</p>"
-        }
-        self.topics_list.clear()
-        self.topics_list.addItems(list(self.help_data.keys()))
-        self.topics_list.setCurrentRow(0)
-
-    def display_topic(self, current, previous):
-        if current:
-            topic = current.text()
-            self.content_display.setHtml(self.help_data.get(topic, "<p>Help topic not found.</p>"))
-
-class KeyboardListenerThread(QThread):
-    """
-    A QThread that runs the pynput keyboard listener.
-    """
-    def __init__(self, app_instance):
-        super().__init__()
-        self.app = app_instance
-        self.listener = None
-
-    def run(self):
-        self.listener = keyboard.Listener(on_press=self.app.on_press)
-        self.listener.start()
-        self.listener.join()
-
-    def stop(self):
-        if self.listener:
-            self.listener.stop()
-
-class MouseListenerThread(QThread):
-    """
-    A QThread that runs the pynput mouse listener.
-    """
-    mouse_moved = pyqtSignal(int, int)
-
-    def __init__(self, app_instance):
-        super().__init__()
-        self.app = app_instance
-        self.listener = None
-
-    def on_move(self, x, y):
-        self.mouse_moved.emit(x, y)
-
-    def run(self):
-        self.listener = mouse.Listener(
-            on_click=self.app.on_click,
-            on_move=self.on_move
-        )
-        self.listener.start()
-        self.listener.join()
-
-    def stop(self):
-        if self.listener:
-            self.listener.stop()
-
-class PingStatusLabel(QLabel):
-    """
-    A frameless, floating QLabel used to display ping status near the cursor.
-    """
-    def __init__(self):
-        super().__init__()
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool  # Prevents it from appearing in the taskbar
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setStyleSheet("font-size: 14pt; font-weight: bold; padding: 5px;")
-
-    def show_message(self, text, color, position):
-        self.setText(text)
-        self.setStyleSheet(f"color: {color}; font-size: 14pt; font-weight: bold; padding: 5px; background-color: rgba(20, 20, 20, 0.7); border-radius: 5px;")
-        self.adjustSize()
-        # Position it above the cursor, slightly to the right
-        self.move(position.x() + 10, position.y() - self.height())
-        self.show()
-
-class PingThread(QThread):
-    """
-    A QThread that runs a ping command and emits the result.
-    """
-    ping_result = pyqtSignal(str, str)
-
-    def __init__(self, ip_address):
-        super().__init__()
-        self.ip_address = ip_address
-        self._proc = None
-        self._stopped = False
-
-    def run(self):
-        output = ""
-        try:
-            command = ['ping', '-n', '4', self.ip_address]
-            self._proc = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-            )
-
-            try:
-                output, _ = self._proc.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
-                self.ping_result.emit('red', "Ping command timed out.")
-                return
-
-            out = (output or '').lower()
-            # Try to find percent-loss or lost packets in a locale-robust way
-            m_pct = re.search(r'(\d+)%\s*loss', out)
-            m_lost = re.search(r'lost\s*=\s*(\d+)', out)
-            lost_pct = None
-            if m_pct:
-                lost_pct = int(m_pct.group(1))
-            elif m_lost:
-                # If we can't get percent directly, approximate 100% loss -> fail
-                lost = int(m_lost.group(1))
-                lost_pct = 100 if lost > 0 else 0
-
-            color = 'green'
-            if lost_pct is None:
-                # Fallback: look for "0 received" or "received = 0"
-                if re.search(r'received\s*=\s*0', out) or re.search(r'\b0\s+received\b', out):
-                    color = 'red'
-            elif lost_pct >= 100:
-                color = 'red'
-
-            self.ping_result.emit(color, output)
-
-        except Exception:
-            logging.exception("Ping failed")
-            self.ping_result.emit('red', output or f"Ping command failed for {self.ip_address}")
-
-    def stop(self):
-        """Stop the running ping subprocess if present and request the thread to end."""
-        self._stopped = True
-        try:
-            if self._proc and self._proc.poll() is None:
-                # Best-effort terminate; if it refuses to die use kill
-                self._proc.terminate()
-                try:
-                    self._proc.wait(timeout=1)
-                except Exception:
-                    self._proc.kill()
-        except Exception:
-            pass
-
 class KeyMapperApp(QMainWindow):
-    # Signal used to run mapping actions on the main (GUI) thread. Emitting
-    # this from the listener thread queues the action onto the Qt event loop
-    # where the single shared keyboard Controller owned by the app will
-    # perform the key presses reliably.
     mapping_action_signal = pyqtSignal(object)
+
     def __init__(self):
         super().__init__()
         self.help_window = None
@@ -331,45 +57,44 @@ class KeyMapperApp(QMainWindow):
         self.mappings = {}
         self.mapping_ids = []
         self.mapping_counter = 1
+        self._editing_mapping_id = None
         self.last_click_time = {}
         self.click_counts = {}
-        # How long between clicks counts as a separate sequence (seconds)
-        # Defaults to 0.6s (configurable via UI)
         self.click_interval = 0.6
-        # Optional in-memory guards for synthetic key events and low-level hooks
-        # (_kbd_available reflects whether the optional 'keyboard' package
-        # is available on the system).
         self._ignore_keys = {}
-        self._kbd_available = _KBD_AVAILABLE
-        self._keyboard_hooks = {}  # map source_key -> handler from 'keyboard' package
+        # keyboard package availability is discovered at module-level above
+        # and mirrored into the instance for convenience.
+        self._kbd_available = bool(_KBD_AVAILABLE)
+
+        self._keyboard_hooks = {}
         self._kbd_ignore = {}
-        # fast lookup table: source_key -> list of mapping details
-        # (window_title, target_key) to avoid iterating full mapping set
-        # on every key event.
         self._source_index = {}
-        # runtime flag: low-level keyboard suppression enabled at startup
-        # only available when keyboard package is installed
         self._kbd_enabled = bool(self._kbd_available)
         self.initUI()
         self.load_mappings_from_config()
-        # Connect mapping action signal -> handler which runs on main thread
         self.mapping_action_signal.connect(self._handle_mapping_action)
         self.start_listeners()
 
-        # Cache of active window title to avoid expensive per-key calls to
-        # pygetwindow in tight keyboard hook loops. Updated periodically on
-        # the GUI thread; keyboard hook reads it under a simple lock.
         self._cached_active_title = ""
         self._active_title_lock = threading.Lock()
-        # Start a short QTimer that updates the cached active window title.
-        # 100ms is a good balance between freshness and overhead.
-        self._active_title_timer = QTimer(self)
-        self._active_title_timer.setInterval(100)
-        self._active_title_timer.timeout.connect(self._update_cached_active_title)
-        self._active_title_timer.start()
 
-        # Keep track of any active ping threads so we can stop them during
-        # shutdown and avoid leaving subprocesses running after the GUI exits.
+        self._active_watcher = None
+        self._active_watcher_available = False
+        try:
+            self._active_watcher = ActiveWindowEventThread(self)
+            self._active_watcher.active_window_changed.connect(self._on_active_window_changed)
+            self._active_watcher.start()
+            self._active_watcher_available = True
+        except Exception:
+            self._active_watcher = None
+            self._active_watcher_available = False
+
+        self._active_title_timer = QTimer(self)
+        self._active_title_timer.setInterval(500)
+        self._active_title_timer.timeout.connect(self._update_cached_active_title)
+        if not self._active_watcher_available:
+            self._active_title_timer.start()
+
         self._ping_threads = set()
 
     def initUI(self):
@@ -532,15 +257,24 @@ class KeyMapperApp(QMainWindow):
         button_layout = QHBoxLayout()
         self.add_button = QPushButton("Add Mapping")
         self.remove_button = QPushButton("Remove Selected")
+        self.edit_button = QPushButton("Edit Selected")
+        self.cancel_edit_button = QPushButton("Cancel Edit")
+        # Hidden until we're in edit mode
+        self.cancel_edit_button.setVisible(False)
         self.refresh_button = QPushButton("Refresh Windows")
         self.clear_button = QPushButton("Clear Fields")
         button_layout.addWidget(self.add_button)
+        button_layout.addWidget(self.edit_button)
+        button_layout.addWidget(self.cancel_edit_button)
         button_layout.addWidget(self.remove_button)
         button_layout.addWidget(self.refresh_button)
         button_layout.addWidget(self.clear_button)
         layout.addLayout(button_layout)
 
         self.mappings_listbox = QListWidget()
+        # Enable a right-click context menu for edit/delete actions
+        self.mappings_listbox.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.mappings_listbox.customContextMenuRequested.connect(self._on_mappings_context_menu)
         layout.addWidget(self.mappings_listbox)
 
         # --- IP Ping Monitor UI ---
@@ -627,6 +361,8 @@ class KeyMapperApp(QMainWindow):
         ping_log_layout.addWidget(self.ping_output_view)
         
         self.add_button.clicked.connect(self.add_mapping)
+        self.edit_button.clicked.connect(self.edit_mapping)
+        self.cancel_edit_button.clicked.connect(self._cancel_editing)
         self.remove_button.clicked.connect(self.remove_mapping)
         self.refresh_button.clicked.connect(self.refresh_window_list)
         self.clear_button.clicked.connect(self.clear)
@@ -777,6 +513,26 @@ class KeyMapperApp(QMainWindow):
                 self._update_hooks_for_active_title(tnorm)
             except Exception:
                 pass
+
+    def _on_active_window_changed(self, new_title: str):
+        """
+        Slot used by ActiveWindowEventThread. The event thread provides a
+        lower-cased title string. Update the cached title and refresh hooks
+        similarly to the polling path.
+        """
+        try:
+            tnorm = (new_title or '').strip().lower()
+            with self._active_title_lock:
+                old = self._cached_active_title
+                self._cached_active_title = tnorm
+
+            if tnorm != old and self._kbd_available and getattr(self, '_kbd_enabled', False):
+                try:
+                    self._update_hooks_for_active_title(tnorm)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def toggle_ip_monitoring(self, checked):
         if checked:
@@ -948,6 +704,10 @@ class KeyMapperApp(QMainWindow):
                 pass
 
     def add_mapping(self):
+        # If we're editing an existing mapping, use the save flow instead
+        if getattr(self, '_editing_mapping_id', None):
+            return self._save_edited_mapping()
+
         source_key = self.source_keyboard_combobox.currentText()
         mouse_button = self.mouse_button_combobox.currentText()
         if source_key:
@@ -957,10 +717,218 @@ class KeyMapperApp(QMainWindow):
         else:
             QMessageBox.warning(self, "Input Error", "Please select a trigger key or button.")
 
+    def edit_mapping(self):
+        """Populate the form with the selected mapping for editing."""
+        selected_item = self.mappings_listbox.currentItem()
+        if not selected_item:
+            return
+
+        selected_index = self.mappings_listbox.row(selected_item)
+        if selected_index < 0 or selected_index >= len(self.mapping_ids):
+            return
+
+        mapping_id = self.mapping_ids[selected_index]
+
+        # Find the mapping details
+        details = None
+        for win_title, mappings in self.mappings.items():
+            if mapping_id in mappings:
+                details = mappings[mapping_id]
+                break
+
+        if not details:
+            return
+
+        # Populate UI fields based on mapping type
+        # Put UI into edit mode
+        self._editing_mapping_id = mapping_id
+        self.add_button.setText("Save Changes")
+        # Show the cancel button while editing
+        try:
+            self.cancel_edit_button.setVisible(True)
+        except Exception:
+            pass
+
+        # Clear fields first
+        self.clear()
+
+        if 'source_key' in details:
+            # Keyboard mapping
+            self.source_keyboard_combobox.setCurrentText(details.get('source_key', ''))
+            self.target_keyboard_combobox.setCurrentText(details.get('target_key', ''))
+            # window
+            self.window_selection_radio1.setChecked(True)
+            self.window_selection_entry.setText(details.get('window_title', ''))
+
+        elif 'mouse_button' in details:
+            # Mouse mapping
+            self.mouse_button_combobox.setCurrentText(details.get('mouse_button', ''))
+            self.press_count_entry.setText(str(details.get('press_count', '')))
+            kb_button = details.get('keyboard_button')
+            if isinstance(kb_button, Key):
+                kb_button = kb_button.name
+            self.target_keyboard_combobox.setCurrentText(str(kb_button))
+            self.window_selection_radio1.setChecked(True)
+            self.window_selection_entry.setText(details.get('window_title', ''))
+
+        # Ensure combobox visibility logic is up to date
+        self.on_combobox_selected()
+
+    def _save_edited_mapping(self):
+        """Save changes from form back into the existing mapping id."""
+        mapping_id = getattr(self, '_editing_mapping_id', None)
+        if not mapping_id:
+            return
+
+        # Determine values from form
+        source_key = self.source_keyboard_combobox.currentText().lower().strip()
+        mouse_button = self.mouse_button_combobox.currentText().lower().strip()
+        target_key = self.target_keyboard_combobox.currentText().lower().strip()
+
+        if self.window_selection_radio1.isChecked():
+            target_window = self.window_selection_entry.text().lower().strip()
+        else:
+            target_window = self.window_selection_combobox.currentText().lower().strip()
+
+        if not target_window:
+            QMessageBox.warning(self, "Input Error", "Please select/enter a target window when saving changes.")
+            return
+
+        # Build new details dict depending on type
+        if source_key:
+            # keyboard mapping
+            modifier_key = self.modifier_key_combobox.currentText()
+            if modifier_key:
+                target_key = f"{modifier_key} + {target_key}"
+
+            if not target_key or not str(target_key).strip():
+                QMessageBox.warning(self, "Input Error", "Please specify a target key when saving a keyboard mapping.")
+                return
+
+            new_details = {
+                'source_key': source_key,
+                'target_key': target_key,
+                'window_title': target_window
+            }
+
+        elif mouse_button:
+            try:
+                press_count = int(self.press_count_entry.text())
+            except ValueError:
+                QMessageBox.warning(self, "Input Error", "Invalid press count. Please enter a number.")
+                return
+
+            modifier_key = self.modifier_key_combobox.currentText()
+            if modifier_key:
+                target_key = f"{modifier_key} + {target_key}"
+
+            if not target_key or not str(target_key).strip():
+                QMessageBox.warning(self, "Input Error", "Please specify a target key when saving a mouse mapping.")
+                return
+
+            final_key = target_key
+            if target_key.startswith('f') and target_key[1:].isdigit():
+                final_key = getattr(Key, target_key.lower(), target_key)
+
+            new_details = {
+                'mouse_button': mouse_button,
+                'press_count': press_count,
+                'keyboard_button': final_key,
+                'window_title': target_window
+            }
+
+        else:
+            QMessageBox.warning(self, "Input Error", "Please select a trigger key or button.")
+            return
+
+        # Update mapping in self.mappings (move if window changed)
+        with QMutexLocker(self.mappings_lock):
+            # Remove from old location
+            old_window = None
+            for w, mappings in list(self.mappings.items()):
+                if mapping_id in mappings:
+                    old_window = w
+                    break
+
+            if old_window is None:
+                QMessageBox.warning(self, "Internal Error", "Original mapping not found; cannot save changes.")
+                self._exit_edit_mode()
+                return
+
+            # Delete old mapping reference
+            try:
+                del self.mappings[old_window][mapping_id]
+                # If the old window group is now empty, remove it
+                if not self.mappings[old_window]:
+                    del self.mappings[old_window]
+            except Exception:
+                pass
+
+            # Insert into new window group
+            if target_window not in self.mappings:
+                self.mappings[target_window] = {}
+
+            self.mappings[target_window][mapping_id] = new_details
+
+        # Reset UI and display
+        self._exit_edit_mode()
+        self.update_mappings_display()
+        self.clear()
+
+    def _exit_edit_mode(self):
+        self._editing_mapping_id = None
+        try:
+            self.add_button.setText("Add Mapping")
+        except Exception:
+            pass
+        # Hide cancel button when not editing
+        try:
+            self.cancel_edit_button.setVisible(False)
+        except Exception:
+            pass
+
+    def _cancel_editing(self):
+        """Abort the current edit and restore UI to Add mode without saving."""
+        # Reset UI fields to a clean state
+        try:
+            self.clear()
+        except Exception:
+            pass
+
+        # Exit edit mode (resets Add button label and hides Cancel)
+        self._exit_edit_mode()
+
+    def _on_mappings_context_menu(self, pos):
+        """Show right-click menu for mapping list with Edit/Delete actions."""
+        item = self.mappings_listbox.itemAt(pos)
+        if not item:
+            return
+
+        menu = QMenu()
+        edit_action = QAction("Edit", self)
+        delete_action = QAction("Delete", self)
+
+        def on_edit():
+            # Select the item and call edit
+            self.mappings_listbox.setCurrentItem(item)
+            self.edit_mapping()
+
+        def on_delete():
+            # Select the item and call remove mapping
+            self.mappings_listbox.setCurrentItem(item)
+            self.remove_mapping()
+
+        edit_action.triggered.connect(on_edit)
+        delete_action.triggered.connect(on_delete)
+
+        menu.addAction(edit_action)
+        menu.addAction(delete_action)
+
+        menu.exec(self.mappings_listbox.mapToGlobal(pos))
+
     def _add_mapping_details(self, details):
         """Adds a validated mapping details dictionary to the central store."""
-        self.mappings_lock.lock()
-        try:
+        with QMutexLocker(self.mappings_lock):
             target_window = details.get('window_title', '')
             if not target_window:
                 return
@@ -974,8 +942,6 @@ class KeyMapperApp(QMainWindow):
             self.mappings[target_window][mapping_id] = details
             self.mapping_ids.append(mapping_id)
             self.update_mappings_display()
-        finally:
-            self.mappings_lock.unlock()
         
         if self._kbd_available and getattr(self, '_kbd_enabled', False):
             try:
@@ -1050,8 +1016,7 @@ class KeyMapperApp(QMainWindow):
         
         selected_index = self.mappings_listbox.row(selected_item)
         
-        self.mappings_lock.lock()
-        try:
+        with QMutexLocker(self.mappings_lock):
             mapping_id = self.mapping_ids.pop(selected_index)
 
             for target_window in self.mappings:
@@ -1060,8 +1025,6 @@ class KeyMapperApp(QMainWindow):
                     break
             
             self.update_mappings_display()
-        finally:
-            self.mappings_lock.unlock()
 
         # Update low-level hooks if suppression is enabled
         if self._kbd_available and getattr(self, '_kbd_enabled', False):
@@ -1138,40 +1101,38 @@ class KeyMapperApp(QMainWindow):
             pass
 
     def on_press(self, key):
-        self.mappings_lock.lock()
         try:
-            if self._kbd_available and getattr(self, '_kbd_enabled', False):
-                return
+            with QMutexLocker(self.mappings_lock):
+                if self._kbd_available and getattr(self, '_kbd_enabled', False):
+                    return
 
-            pressed_key = None
-            if isinstance(key, keyboard.KeyCode):
-                pressed_key = getattr(key, 'char', None)
-            else:
-                pressed_key = getattr(key, 'name', None)
+                pressed_key = None
+                if isinstance(key, keyboard.KeyCode):
+                    pressed_key = getattr(key, 'char', None)
+                else:
+                    pressed_key = getattr(key, 'name', None)
 
-            if not pressed_key:
-                return
+                if not pressed_key:
+                    return
 
-            pressed_key = pressed_key.lower().strip()
+                pressed_key = pressed_key.lower().strip()
 
-            with self._active_title_lock:
-                current_title = self._cached_active_title
+                with self._active_title_lock:
+                    current_title = self._cached_active_title
 
-            if not current_title:
-                return
+                if not current_title:
+                    return
 
-            for window_title, mappings in self.mappings.items():
-                if not window_title:
-                    continue
-                if window_title.strip().lower() in current_title:
-                    for details in mappings.values():
-                        if details.get('source_key', '').lower().strip() == pressed_key:
-                            self.mapping_action_signal.emit(details['target_key'])
-                            return
+                for window_title, mappings in self.mappings.items():
+                    if not window_title:
+                        continue
+                    if window_title.strip().lower() in current_title:
+                        for details in mappings.values():
+                            if details.get('source_key', '').lower().strip() == pressed_key:
+                                self.mapping_action_signal.emit(details['target_key'])
+                                return
         except Exception:
             logging.exception("on_press")
-        finally:
-            self.mappings_lock.unlock()
 
     def on_click(self, x, y, button, pressed):
         if not pressed:
@@ -1197,8 +1158,7 @@ class KeyMapperApp(QMainWindow):
 
         action_to_run = None
 
-        self.mappings_lock.lock()
-        try:
+        with QMutexLocker(self.mappings_lock):
             for partial_title, mappings in self.mappings.items():
                 if partial_title.strip().lower() in target_window_title:
                     for details in mappings.values():
@@ -1214,8 +1174,7 @@ class KeyMapperApp(QMainWindow):
 
                     if action_to_run:
                         break
-        finally:
-            self.mappings_lock.unlock()
+            pass
 
         if not action_to_run:
             return
@@ -1226,15 +1185,12 @@ class KeyMapperApp(QMainWindow):
         """
         Returns the platform-specific, user-writable path for the mappings.ini file.
         """
-        app_data_path = os.environ.get('LOCALAPPDATA')
-        if not app_data_path:
-            try:
-                app_data_path = os.path.expanduser(r"~\AppData\Local")
-            except Exception:
-                return 'mappings.ini'
-
+        app_data_path = os.environ.get('LOCALAPPDATA') or os.path.expanduser(r"~\AppData\Local")
         config_dir = os.path.join(app_data_path, 'S-Mapper')
-        os.makedirs(config_dir, exist_ok=True)
+        try:
+            os.makedirs(config_dir, exist_ok=True)
+        except Exception:
+            return 'mappings.ini'
         return os.path.join(config_dir, 'mappings.ini')
 
     def save_mappings_to_config(self):
@@ -1286,24 +1242,15 @@ class KeyMapperApp(QMainWindow):
         try:
             kb_button_str = keyboard_button if isinstance(keyboard_button, str) else keyboard_button.name
             
+
             parts = [p.strip() for p in kb_button_str.replace(' + ', '+').split('+')]
             main_key = parts[-1]
+            # mapping for known modifier names -> Key attributes
+            mod_map = {'ctrl': Key.ctrl, 'control': Key.ctrl, 'shift': Key.shift, 'alt': Key.alt,
+                       'win': Key.cmd, 'windows': Key.cmd, 'cmd': Key.cmd, 'meta': Key.cmd}
+
             modifiers = [m.lower() for m in parts[:-1] if m]
-            modifier_keys = []
-
-            for m in modifiers:
-                if m in ('ctrl', 'control'):
-                    modifier_keys.append(Key.ctrl)
-                elif m == 'shift':
-                    modifier_keys.append(Key.shift)
-                elif m == 'alt':
-                    modifier_keys.append(Key.alt)
-                elif m in ('win', 'windows', 'cmd', 'meta'):
-                    modifier_keys.append(Key.cmd)
-                else:
-                    logging.warning(f"Unknown modifier key: {m}")
-
-            modifier_keys = [m for m in modifier_keys if m is not None]
+            modifier_keys = [mod_map.get(m) for m in modifiers if mod_map.get(m) is not None]
             key_to_press = getattr(Key, main_key, main_key)
 
             if modifier_keys:
@@ -1441,8 +1388,16 @@ class KeyMapperApp(QMainWindow):
         # and non-Qt shims from raising AttributeError during collection.
         _mlock = getattr(self, 'mappings_lock', None)
         if _mlock:
-            _mlock.lock()
-        try:
+            with QMutexLocker(_mlock):
+                for mappings in getattr(self, 'mappings', {}).values():
+                    for details in mappings.values():
+                        if 'source_key' in details and details['source_key']:
+                            sk = details['source_key']
+                            source_keys.add(sk)
+                            self._source_index.setdefault(sk, []).append(
+                                (details.get('window_title', ''), details.get('target_key'))
+                            )
+        else:
             for mappings in getattr(self, 'mappings', {}).values():
                 for details in mappings.values():
                     if 'source_key' in details and details['source_key']:
@@ -1451,12 +1406,6 @@ class KeyMapperApp(QMainWindow):
                         self._source_index.setdefault(sk, []).append(
                             (details.get('window_title', ''), details.get('target_key'))
                         )
-        finally:
-            if _mlock:
-                try:
-                    _mlock.unlock()
-                except Exception:
-                    pass
 
         # After rebuilding the index, update hooks to match the current
         # active window title (so only keys targeted to the current
@@ -1680,6 +1629,19 @@ class KeyMapperApp(QMainWindow):
             pass
 
         try:
+            if getattr(self, '_active_watcher', None):
+                try:
+                    self._active_watcher.stop()
+                except Exception:
+                    pass
+                try:
+                    self._active_watcher.wait(2000)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
             self._unhook_all_keyboard_hooks()
         except Exception:
             pass
@@ -1723,24 +1685,3 @@ class KeyMapperApp(QMainWindow):
             pass
 
         event.accept()
-
-if __name__ == "__main__":
-    # Configure console logging for INFO and up
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-    # Configure file logging for ERROR and up
-    log_file_path = get_log_filepath()
-    file_handler = logging.FileHandler(log_file_path)
-    file_handler.setLevel(logging.ERROR)
-    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(file_formatter)
-    logging.getLogger('').addHandler(file_handler)
-
-    # Enable High-DPI scaling before creating the QApplication
-    # This is the most reliable method across Qt versions
-    os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
-    os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
-    app = QApplication(sys.argv)
-    ex = KeyMapperApp()
-    ex.show()
-    sys.exit(app.exec())
