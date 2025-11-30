@@ -29,6 +29,23 @@ pytest -q
 ## Usage
 
 1. **Launch the application**: Run the `s_mapper.py` script or the compiled executable.
+
+Developer convenience runners
+----------------------------
+
+Two small helpers are provided to make launching the app from the repository root easy during development:
+
+python:
+
+```powershell
+python run_app.py
+```
+
+PowerShell (uses venv if present):
+
+```powershell
+.\scripts\run_app.ps1
+```
 2. **Configure Mappings**:
    - **For Mouse Mappings**:
      - Select a mouse button from the dropdown list.

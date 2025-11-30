@@ -58,8 +58,11 @@ def test_close_event_waits_on_threads(monkeypatch):
     # Build a fake object with the attributes closeEvent expects
     obj = type('O', (), {})()
     obj.save_mappings_to_config = lambda: None
+    obj.save_macros_to_config = lambda: None
     obj.keyboard_thread = DummyThread()
     obj.mouse_thread = DummyThread()
+    obj.macro_thread = DummyThread()
+    obj._macro_recorder = DummyThread()
     obj._active_title_timer = DummyTimer()
     obj._unhook_all_keyboard_hooks = lambda : None
     obj.tray_icon = DummyTray()
@@ -74,6 +77,8 @@ def test_close_event_waits_on_threads(monkeypatch):
     assert obj.keyboard_thread.waited_with is not None
     assert obj.mouse_thread.stopped is True
     assert obj.mouse_thread.waited_with is not None
+    assert obj.macro_thread.waited_with is not None
+    assert obj._macro_recorder.waited_with is not None
     assert obj._active_title_timer.stopped is True
     assert obj.tray_icon.hidden is True
     assert ev.accepted is True

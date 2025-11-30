@@ -30,6 +30,7 @@ __pycache__/
 # ===============================
 # Ignore user-specific configuration
 mappings.ini
+macros.ini
 
 # Ignore old application files
 key_mapper_app.py
