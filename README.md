@@ -28,7 +28,11 @@ pytest -q
 
 ## Usage
 
-1. **Launch the application**: Run the `s_mapper.py` script or the compiled executable.
+1. **Launch the application**: Run the `run_app.py` convenience runner or the compiled executable. You can also run the package entry directly:
+
+```powershell
+python -m s_mapper.app
+```
 
 Developer convenience runners
 ----------------------------

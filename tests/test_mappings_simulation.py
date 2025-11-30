@@ -371,6 +371,50 @@ def test_handle_mapping_action_injects_keys(monkeypatch):
     assert any(e[0] == 'release' for e in events)
 
 
+def test_handle_mapping_action_tolerates_object_without_name(monkeypatch):
+    """Ensure a target object with no `.name` attribute doesn't raise."""
+    obj = type('O', (), {})()
+
+    # Dummy keyboard controller that records operations
+    events = []
+
+    class DummyController:
+        def pressed(self, *mods):
+            class Ctx:
+                def __enter__(self):
+                    events.append(('pressed_enter',))
+                def __exit__(self, *a):
+                    events.append(('pressed_exit',))
+            return Ctx()
+
+        def press(self, k):
+            events.append(('press', k))
+
+        def release(self, k):
+            events.append(('release', k))
+
+    obj.keyboard_controller = DummyController()
+
+    # Build a fake object without a name attribute
+    class NoName:
+        def __str__(self):
+            return 'no-name'
+
+    handler = m.KeyMapperApp._handle_mapping_action.__get__(obj, m.KeyMapperApp)
+    # Should not raise
+    handler(NoName())
+
+
+def test_handle_mapping_action_handles_none_safely(monkeypatch):
+    """Calling with None should be a no-op and not raise an exception."""
+    obj = type('O', (), {})()
+    obj.keyboard_controller = type('K', (), {'press': lambda *_: None, 'release': lambda *_: None})()
+
+    handler = m.KeyMapperApp._handle_mapping_action.__get__(obj, m.KeyMapperApp)
+    # Should return cleanly
+    handler(None)
+
+
 def test_on_clipboard_change_starts_ping_thread(monkeypatch):
     obj = type('O', (), {})()
 

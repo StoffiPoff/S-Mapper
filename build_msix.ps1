@@ -92,7 +92,10 @@ $procs = @()
 if ($Variant -eq 'full' -or $Variant -eq 'both') {
     if (ShouldBuildExe 's_mapper_full.exe') {
         Write-Host "Building full variant (includes keyboard if present in venv)" -ForegroundColor Cyan
-        $fullArgs = @('--noconfirm','--onefile','--windowed','--name','s_mapper_full','--icon','assets\Square150x150Logo.png','--add-data','assets;assets','s_mapper\app.py')
+        # Ensure the s_mapper package submodules are collected by PyInstaller
+        # so the onefile executable includes the full application (not just
+        # the tiny runner). Use --collect-submodules to bring in all submodules.
+        $fullArgs = @('--noconfirm','--onefile','--windowed','--name','s_mapper_full','--icon','assets\Square150x150Logo.png','--add-data','assets;assets','--collect-submodules','s_mapper','run_app.py')
         if ($Parallel.IsPresent -and ($Variant -eq 'both')) {
             $p = Start-Process -FilePath $pyInstallerPath -ArgumentList $fullArgs -PassThru
             $procs += $p
@@ -108,7 +111,8 @@ if ($Variant -eq 'full' -or $Variant -eq 'both') {
 if ($Variant -eq 'lite' -or $Variant -eq 'both') {
     if (ShouldBuildExe 's_mapper_lite.exe') {
         Write-Host "Building lite variant (explicitly excludes 'keyboard' to avoid low-level suppression dependency)" -ForegroundColor Cyan
-        $liteArgs = @('--noconfirm','--onefile','--windowed','--name','s_mapper_lite','--icon','assets\Square150x150Logo.png','--add-data','assets;assets','--exclude-module','keyboard','s_mapper\app.py')
+        # As above: collect all s_mapper submodules for the lite variant too.
+        $liteArgs = @('--noconfirm','--onefile','--windowed','--name','s_mapper_lite','--icon','assets\Square150x150Logo.png','--add-data','assets;assets','--exclude-module','keyboard','--collect-submodules','s_mapper','run_app.py')
         if ($Parallel.IsPresent -and ($Variant -eq 'both')) {
             $p = Start-Process -FilePath $pyInstallerPath -ArgumentList $liteArgs -PassThru
             $procs += $p

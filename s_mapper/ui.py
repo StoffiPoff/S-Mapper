@@ -1583,7 +1583,25 @@ class KeyMapperApp(QMainWindow):
             # Otherwise treat as a basic keyboard target
             if keyboard_button is None:
                 return
-            kb_button_str = keyboard_button if isinstance(keyboard_button, str) else keyboard_button.name
+
+            # Be defensive when obtaining a string representation for the
+            # keyboard target. In some malformed configs or edge-cases the
+            # value may be a non-string object (or an object without a
+            # `name` attribute). Avoid raising AttributeError here by
+            # attempting to read `.name` safely and falling back to string
+            # conversion.
+            if isinstance(keyboard_button, str):
+                kb_button_str = keyboard_button
+            else:
+                # Prefer a `name` attribute if present and non-empty; else
+                # fall back to the object's string representation.
+                kb_button_str = getattr(keyboard_button, 'name', None)
+                if kb_button_str is None:
+                    try:
+                        kb_button_str = str(keyboard_button)
+                    except Exception:
+                        # last-resort fallback
+                        kb_button_str = ''
             
 
             parts = [p.strip() for p in kb_button_str.replace(' + ', '+').split('+')]
