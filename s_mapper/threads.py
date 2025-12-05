@@ -3,6 +3,7 @@ import threading
 import logging
 import queue
 import time
+import re
 from PyQt6.QtCore import QThread, pyqtSignal
 from pynput import mouse, keyboard
 
@@ -210,7 +211,42 @@ class MacroThread(QThread):
         """Add a macro dict to the internal queue."""
         if not isinstance(macro, dict):
             return
-        self._queue.put(macro)
+        # Copy and expand any "x N" repeat syntax (e.g. "key:tab x 15")
+        expanded = self._expand_actions(macro.get('actions', []) or [])
+        macro_copy = dict(macro)
+        macro_copy['actions'] = expanded
+        self._queue.put(macro_copy)
+
+    def _expand_actions(self, actions):
+        """Expand repeat shorthand like "key:tab x 15" into individual actions."""
+        result = []
+        for act in actions:
+            result.extend(self._expand_action(act))
+        return result
+
+    def _expand_action(self, act):
+        if not isinstance(act, str):
+            return [act]
+
+        text = act.strip()
+        # Match patterns like "key:tab x 15" (case-insensitive on the x)
+        # Allow both "x 15" and "x15" forms; require at least one space before the x
+        m = re.match(r"^(?P<body>.+?)\s+[xX]\s*(?P<count>\d+)\s*$", text)
+        if m:
+            body = m.group('body').strip()
+            try:
+                count = int(m.group('count'))
+            except Exception:
+                count = 1
+            # Prevent runaway expansion
+            max_repeat = 200
+            if count < 1:
+                count = 0
+            if count > max_repeat:
+                count = max_repeat
+            return [body] * count
+
+        return [act]
 
     def run(self):
         while not self._stop_event.is_set():

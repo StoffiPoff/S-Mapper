@@ -44,27 +44,33 @@ if False:  # pragma: no cover - static import for PyInstaller analysis
     # up the s_mapper package and submodules (including PyQt hooks).
     import s_mapper.app  # type: ignore
 
-# Ensure repository path is discoverable first and then run the package
-# entrypoint as if executed with -m so the module-level __main__ in
-# s_mapper.app runs.
-ensure_repo_on_syspath()
-try:
-    runpy.run_module('s_mapper.app', run_name='__main__')
-except Exception as exc:  # pragma: no cover - hard to reproduce here
-    # write traceback to the local app error logfile so users running the
-    # packaged exe get a place to look for details
-    import traceback
+def main():
+    """Entry point used when executing the runner directly."""
+    # Ensure repository path is discoverable first and then run the package
+    # entrypoint as if executed with -m so the module-level __main__ in
+    # s_mapper.app runs.
+    ensure_repo_on_syspath()
     try:
-        log_dir = Path(__file__).resolve().parent
-        # Use LOCALAPPDATA path if available, otherwise write next to runner
-        appdata = os.environ.get('LOCALAPPDATA') or os.path.expanduser(r"~\AppData\Local")
-        err_path = os.path.join(appdata, 'S-Mapper', 'error.log')
-        os.makedirs(os.path.dirname(err_path), exist_ok=True)
-        with open(err_path, 'a', encoding='utf8') as fh:
-            fh.write(traceback.format_exc())
-    except Exception:
-        # last resort: print to stderr so console builds show the error
-        print('Error during startup:')
-        traceback.print_exc()
-    # Re-raise so process still terminates with non-zero exit code.
-    raise
+        runpy.run_module('s_mapper.app', run_name='__main__')
+    except Exception as exc:  # pragma: no cover - hard to reproduce here
+        # write traceback to the local app error logfile so users running the
+        # packaged exe get a place to look for details
+        import traceback
+        try:
+            log_dir = Path(__file__).resolve().parent
+            # Use LOCALAPPDATA path if available, otherwise write next to runner
+            appdata = os.environ.get('LOCALAPPDATA') or os.path.expanduser(r"~\AppData\Local")
+            err_path = os.path.join(appdata, 'S-Mapper', 'error.log')
+            os.makedirs(os.path.dirname(err_path), exist_ok=True)
+            with open(err_path, 'a', encoding='utf8') as fh:
+                fh.write(traceback.format_exc())
+        except Exception:
+            # last resort: print to stderr so console builds show the error
+            print('Error during startup:')
+            traceback.print_exc()
+        # Re-raise so process still terminates with non-zero exit code.
+        raise
+
+
+if __name__ == "__main__":
+    main()

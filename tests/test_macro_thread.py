@@ -167,6 +167,53 @@ def test_macro_thread_handles_tab_action(monkeypatch):
     assert found_press and found_release
 
 
+def test_macro_thread_expands_repeat_shorthand(monkeypatch):
+    mod = importlib.import_module('s_mapper.threads')
+    app = type('A', (), {})()
+    app._macro_running = False
+
+    ops = []
+
+    class DummyController:
+        def type(self, s):
+            ops.append(('type', s))
+
+        def press(self, k):
+            ops.append(('press', k))
+
+        def release(self, k):
+            ops.append(('release', k))
+
+    monkeypatch.setattr(mod.keyboard, 'Controller', lambda: DummyController())
+
+    mt = mod.MacroThread(app=app)
+    mt.char_delay = 0.001
+
+    # Repeat syntax should expand to 3 tab key presses/releases (with/without space)
+    macro = {'id': 'rep', 'name': 'rep', 'actions': ['key:tab x 3', 'key:tab x3', 'text:OK']}
+    mt.enqueue_macro(macro)
+
+    mt.start()
+    import time as _t
+    # Wait for macro to start then finish (sets app._macro_running True/False)
+    deadline = _t.time() + 1.0
+    while not getattr(app, '_macro_running', False) and _t.time() < deadline:
+        _t.sleep(0.02)
+    deadline = _t.time() + 1.0
+    while getattr(app, '_macro_running', False) and _t.time() < deadline:
+        _t.sleep(0.02)
+    mt.stop()
+    mt.wait(1000)
+
+    tab_presses = [op for op in ops if op[0] == 'press' and 'tab' in str(getattr(op[1], 'name', op[1])).lower()]
+    tab_releases = [op for op in ops if op[0] == 'release' and 'tab' in str(getattr(op[1], 'name', op[1])).lower()]
+
+    # expect 3 + 3 = 6 tab presses/releases
+    assert len(tab_presses) == 6
+    assert len(tab_releases) == 6
+    assert ('type', 'OK') in ops
+
+
 def test_macro_abort_on_external_input(monkeypatch):
     # MacroThread should stop current macro when abort_current_macro is called
     mod = importlib.import_module('s_mapper.threads')

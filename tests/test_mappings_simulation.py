@@ -115,14 +115,21 @@ def test_handle_mapping_action_enqueues_macro(monkeypatch):
     # record enqueue calls
     enqueued = []
     class DummyMacroThread:
+        def __init__(self):
+            self._running = True
         def enqueue_macro(self, m):
             enqueued.append(m)
+        def isRunning(self):
+            return self._running
+        def start(self):
+            self._running = True
 
     obj.macro_thread = DummyMacroThread()
     # ping_output_view should accept insertPlainText calls
     obj.ping_output_view = type('P', (), {'insertPlainText': lambda s: None})()
 
     from s_mapper.ui import KeyMapperApp
+    obj._ensure_macro_runtime = lambda : True
     handler = KeyMapperApp._handle_mapping_action.__get__(obj, KeyMapperApp)
     handler({'type': 'macro', 'macro_id': 'Macro 1'})
 
@@ -149,8 +156,14 @@ def test_macro_trigger_from_key_can_fire_multiple_times():
     # dummy enqueue recorder
     enqueued = []
     class DummyMacroThread:
+        def __init__(self):
+            self._running = True
         def enqueue_macro(self, m):
             enqueued.append(m)
+        def isRunning(self):
+            return self._running
+        def start(self):
+            self._running = True
 
     obj.macro_thread = DummyMacroThread()
 
@@ -165,6 +178,7 @@ def test_macro_trigger_from_key_can_fire_multiple_times():
     # bind handler and replace the object's signal
     from s_mapper.ui import KeyMapperApp
     handler = KeyMapperApp._handle_mapping_action.__get__(obj, KeyMapperApp)
+    obj._ensure_macro_runtime = lambda : True
     obj.mapping_action_signal = Emitter(handler)
 
     # Simulate two key presses
@@ -174,6 +188,79 @@ def test_macro_trigger_from_key_can_fire_multiple_times():
     press(fake_key)
 
     assert len(enqueued) == 2
+
+
+def test_rebuild_macro_triggers_populates_mappings():
+    obj = type('O', (), {})()
+    from PyQt6.QtCore import QMutex
+    obj.mappings_lock = QMutex()
+    obj.mappings = {}
+    obj.mapping_ids = []
+    obj._kbd_available = False
+    obj._kbd_enabled = False
+
+    # two macros: keyboard trigger and mouse trigger
+    obj.macros = [
+        {'id': 'Macro 1', 'name': 'A', 'actions': ['text:hi'], 'trigger_type': 'keyboard', 'source_key': 'q', 'window_title': 'myapp'},
+        {'id': 'Macro 2', 'name': 'B', 'actions': ['text:hi'], 'trigger_type': 'mouse', 'mouse_button': 'left', 'press_count': 2, 'window_title': 'other'},
+    ]
+
+    from s_mapper.ui import KeyMapperApp
+    rebuild = KeyMapperApp._rebuild_macro_triggers_from_macros.__get__(obj, KeyMapperApp)
+    rebuild()
+
+    assert 'myapp' in obj.mappings and 'Macro 1' in obj.mappings['myapp']
+    assert 'other' in obj.mappings and 'Macro 2' in obj.mappings['other']
+    assert 'Macro 1' in obj.mapping_ids and 'Macro 2' in obj.mapping_ids
+
+
+def test_low_level_hook_aborts_running_macro(monkeypatch):
+    from s_mapper.ui import KeyMapperApp
+
+    obj = type('O', (), {})()
+    from PyQt6.QtCore import QMutex
+    obj.mappings_lock = QMutex()
+    obj._kbd_available = True
+    obj._kbd_enabled = True
+    obj._active_title_lock = __import__('threading').Lock()
+    obj._cached_active_title = 'mywindow'
+    obj._source_index = {'q': [('mywindow', 'x')]}
+    obj._keyboard_hooks = {}
+    obj._kbd_ignore = {}
+    obj._macro_running = True
+    obj._last_injected_event_time = 0.0
+    aborted = {'called': False}
+
+    class DummyMacroThread:
+        def abort_current_macro(self):
+            aborted['called'] = True
+
+    obj.macro_thread = DummyMacroThread()
+
+    captured = {}
+
+    def fake_on_press_key(key, callback, suppress=False):
+        captured['cb'] = callback
+        return {'h': key}
+
+    monkeypatch.setattr(__import__('s_mapper.ui', fromlist=['kbd']), 'kbd', type('K', (), {
+        'on_press_key': staticmethod(fake_on_press_key),
+        'is_pressed': staticmethod(lambda *a, **k: False),
+        'send': staticmethod(lambda *a, **k: None),
+        'unhook': staticmethod(lambda *a, **k: None),
+    }))
+
+    obj._update_hooks_for_active_title = KeyMapperApp._update_hooks_for_active_title.__get__(obj, KeyMapperApp)
+    obj._refresh_keyboard_hooks = KeyMapperApp._refresh_keyboard_hooks.__get__(obj, KeyMapperApp)
+
+    obj._refresh_keyboard_hooks()
+
+    assert 'cb' in captured
+
+    event = type('E', (), {'event_type': 'down', 'name': 'q'})()
+    captured['cb'](event)
+
+    assert aborted['called'] is True
 
 
 def test_low_level_hook_callback_enqueues_macro_multiple_times(monkeypatch):
@@ -196,8 +283,14 @@ def test_low_level_hook_callback_enqueues_macro_multiple_times(monkeypatch):
 
     enqueued = []
     class DummyMacroThread:
+        def __init__(self):
+            self._running = True
         def enqueue_macro(self, m):
             enqueued.append(m)
+        def isRunning(self):
+            return self._running
+        def start(self):
+            self._running = True
 
     obj.macro_thread = DummyMacroThread()
 
@@ -210,6 +303,7 @@ def test_low_level_hook_callback_enqueues_macro_multiple_times(monkeypatch):
         def emit(self, v):
             self.cb(v)
 
+    obj._ensure_macro_runtime = lambda : True
     obj.mapping_action_signal = Emitter(handler)
 
     # prepare internal structures used by _refresh_keyboard_hooks
@@ -252,9 +346,8 @@ def test_low_level_hook_callback_enqueues_macro_multiple_times(monkeypatch):
     assert len(enqueued) == 2
 
 
-def test_keyboard_hook_no_error_when_bucket_no_match(monkeypatch):
-    """Ensure callback doesn't reference uninitialized locals when the
-    bucket contains entries that don't match the active window title."""
+def test_keyboard_hook_skips_unmatched_active_window(monkeypatch):
+    """When no mappings match the active window, hooks should be removed and not added."""
     from s_mapper.ui import KeyMapperApp
 
     obj = type('O', (), {})()
@@ -265,32 +358,42 @@ def test_keyboard_hook_no_error_when_bucket_no_match(monkeypatch):
     obj._active_title_lock = __import__('threading').Lock()
     obj._cached_active_title = 'mywindow'
 
-    # bucket contains an entry that will *not* match the active title
-    obj._source_index = {'q': [('otherwindow', 'x')]}
-    obj._keyboard_hooks = {}
+    # mapping points at a different window title than the active one
+    obj.mappings = {'mywindow': {'Mapping 1': {'source_key': 'q', 'target_key': 'x', 'window_title': 'otherwindow'}}}
+    obj._source_index = {}
+    obj._keyboard_hooks = {'q': 'old_handle'}
     obj._kbd_ignore = {}
 
-    captured = {}
+    calls = {'on': 0, 'unhook': 0}
 
-    def fake_on_press_key(key, callback, suppress=False):
-        captured['cb'] = callback
-        return {'key': key}
+    class KbdStub:
+        def on_press_key(self, *a, **k):
+            calls['on'] += 1
+            return {'h': 'new'}
+
+        def unhook(self, handle):
+            calls['unhook'] += 1
+
+        def is_pressed(self, *a, **k):
+            return False
+
+        def send(self, *a, **k):
+            calls.setdefault('send', 0)
+            calls['send'] += 1
 
     import importlib
     ui_mod = importlib.import_module('s_mapper.ui')
-    monkeypatch.setattr(ui_mod, 'kbd', type('K', (), {'on_press_key': fake_on_press_key, 'is_pressed': lambda *_: False, 'send': lambda *_: None}))
+    monkeypatch.setattr(ui_mod, 'kbd', KbdStub())
 
-    # bind the nested helper
+    obj._unhook_all_keyboard_hooks = KeyMapperApp._unhook_all_keyboard_hooks.__get__(obj, KeyMapperApp)
     obj._update_hooks_for_active_title = KeyMapperApp._update_hooks_for_active_title.__get__(obj, KeyMapperApp)
-    # call refresh which should not raise and should create a callback
+
     refresh = KeyMapperApp._refresh_keyboard_hooks.__get__(obj, KeyMapperApp)
     refresh()
 
-    assert 'cb' in captured
-
-    # build an event and call the callback; no exception should be raised
-    event = type('E', (), {'event_type': 'down', 'name': 'q'})()
-    captured['cb'](event)
+    assert calls['on'] == 0
+    assert calls['unhook'] == 1
+    assert obj._keyboard_hooks == {}
 
 
 def test_macro_running_flag_blocks_mappings():

@@ -20,7 +20,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
+python-3.11*
 # Ignore local Python environment
 /.venv/
 .venv

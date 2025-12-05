@@ -99,8 +99,9 @@ class KeyMapperApp(QMainWindow):
         self._active_title_timer = QTimer(self)
         self._active_title_timer.setInterval(500)
         self._active_title_timer.timeout.connect(self._update_cached_active_title)
-        if not self._active_watcher_available:
-            self._active_title_timer.start()
+        # Always run the timer so we detect title changes within the same
+        # foreground window (foreground-change events won't fire for title-only updates).
+        self._active_title_timer.start()
 
         self._ping_threads = set()
 
@@ -109,6 +110,8 @@ class KeyMapperApp(QMainWindow):
         # user input and synthetic events produced by MacroThread so we don't
         # abort macros on their own output.
         self._last_injected_event_time = 0.0
+        # Supervisor timer to ensure input listeners/hooks remain active
+        self._listener_supervisor = None
 
     def initUI(self):
         self.setWindowTitle("S-Mapper")
@@ -306,13 +309,7 @@ class KeyMapperApp(QMainWindow):
         self.mouse_thread.start()
         # Macro processing background thread
         try:
-            self.macro_thread = MacroThread(app=self)
-            # Show log messages in the Ping Log view for now (light integration)
-            try:
-                self.macro_thread.macro_log.connect(lambda s: self.ping_output_view.insertPlainText(s + "\n"))
-            except Exception:
-                pass
-            self.macro_thread.start()
+            self._ensure_macro_runtime()
         except Exception:
             self.macro_thread = None
         # If keyboard package-based low-level suppression is available,
@@ -322,6 +319,15 @@ class KeyMapperApp(QMainWindow):
                 self._refresh_keyboard_hooks()
             except Exception:
                 pass
+
+        # Start a supervisor timer to detect listener failures and stale hooks
+        try:
+            self._listener_supervisor = QTimer(self)
+            self._listener_supervisor.setInterval(5000)
+            self._listener_supervisor.timeout.connect(self._ensure_input_listeners)
+            self._listener_supervisor.start()
+        except Exception:
+            self._listener_supervisor = None
 
     def update_label_position(self, x, y):
         if self.ping_status_label.isVisible():
@@ -372,6 +378,25 @@ class KeyMapperApp(QMainWindow):
                     pass
         except Exception:
             pass
+
+    def _ensure_macro_runtime(self):
+        """Ensure a macro processing thread exists and is running."""
+        mt = getattr(self, 'macro_thread', None)
+        if mt and getattr(mt, 'isRunning', lambda: False)():
+            return True
+
+        try:
+            mt = MacroThread(app=self)
+            try:
+                mt.macro_log.connect(lambda s: self.ping_output_view.insertPlainText(s + "\n"))
+            except Exception:
+                pass
+            mt.start()
+            self.macro_thread = mt
+            return True
+        except Exception:
+            self.macro_thread = None
+            return False
 
     def toggle_ip_monitoring(self, checked):
         if checked:
@@ -1041,7 +1066,7 @@ class KeyMapperApp(QMainWindow):
         if sel < 0 or sel >= len(self.macros):
             return
         macro = self.macros[sel]
-        if getattr(self, 'macro_thread', None):
+        if self._ensure_macro_runtime():
             try:
                 self.macro_thread.enqueue_macro(macro)
                 QMessageBox.information(self, "Macro queued", f"Macro '{macro.get('name')}' queued for execution.")
@@ -1565,17 +1590,20 @@ class KeyMapperApp(QMainWindow):
                     if keyboard_button.get('type') == 'macro':
                         macro_id = keyboard_button.get('macro_id')
                         macro = self.macros_by_id.get(macro_id)
-                        if macro and getattr(self, 'macro_thread', None):
-                            try:
-                                self.macro_thread.enqueue_macro(macro)
+                        if macro:
+                            if self._ensure_macro_runtime():
                                 try:
-                                    self.ping_output_view.insertPlainText(f"Macro queued: {macro.get('name','<unnamed>')}\n")
+                                    self.macro_thread.enqueue_macro(macro)
+                                    try:
+                                        self.ping_output_view.insertPlainText(f"Macro queued: {macro.get('name','<unnamed>')}\n")
+                                    except Exception:
+                                        pass
                                 except Exception:
-                                    pass
-                            except Exception:
-                                logging.exception('Failed to enqueue macro')
+                                    logging.exception('Failed to enqueue macro')
+                            else:
+                                logging.warning('Macro runtime unavailable; cannot enqueue macro')
                         else:
-                            logging.warning('Macro mapping triggered but macro runtime or macro not found')
+                            logging.warning('Macro mapping triggered but macro not found')
                 except Exception:
                     logging.exception('Error processing macro mapping')
                 return
@@ -1826,12 +1854,89 @@ class KeyMapperApp(QMainWindow):
         except Exception:
             pass
 
+        # Rebuild trigger mappings for loaded macros so keybinds work immediately
+        try:
+            self._rebuild_macro_triggers_from_macros()
+        except Exception:
+            logging.exception('Failed to rebuild macro trigger mappings after load')
+
     def _on_interval_changed(self, value: float):
         # Called when the UI spinbox changes; keep internal state in sync
         try:
             self.click_interval = float(value)
         except Exception:
             pass
+
+    def _rebuild_macro_triggers_from_macros(self):
+        """Ensure macro-trigger mappings are present for all loaded macros."""
+        # Nothing to do if we have no macros list
+        if not hasattr(self, 'macros'):
+            return
+
+        modified = False
+        lock = getattr(self, 'mappings_lock', None)
+        ctx = lock if lock else None
+
+        def _enter_lock(l):
+            try:
+                if l:
+                    l.lock()
+            except Exception:
+                pass
+
+        def _exit_lock(l):
+            try:
+                if l:
+                    l.unlock()
+            except Exception:
+                pass
+
+        _enter_lock(ctx)
+        try:
+            if not hasattr(self, 'mappings'):
+                self.mappings = {}
+            if not hasattr(self, 'mapping_ids'):
+                self.mapping_ids = []
+
+            for macro in self.macros:
+                mid = macro.get('id')
+                trigger_type = macro.get('trigger_type', 'none')
+                window_title = (macro.get('window_title') or '').strip().lower()
+                if not mid or trigger_type not in ('keyboard', 'mouse') or not window_title:
+                    continue
+
+                details = {'type': 'macro', 'macro_id': mid, 'window_title': window_title}
+                if trigger_type == 'keyboard':
+                    details['source_key'] = (macro.get('source_key') or '').strip().lower()
+                    if not details['source_key']:
+                        continue
+                else:
+                    details['mouse_button'] = (macro.get('mouse_button') or '').strip().lower()
+                    details['press_count'] = int(macro.get('press_count') or 0)
+                    if not details['mouse_button'] or not details['press_count']:
+                        continue
+
+                if window_title not in self.mappings:
+                    self.mappings[window_title] = {}
+
+                self.mappings[window_title][mid] = details
+                if mid not in getattr(self, 'mapping_ids', []):
+                    self.mapping_ids.append(mid)
+                modified = True
+        finally:
+            _exit_lock(ctx)
+
+        if modified:
+            try:
+                self.update_mappings_display()
+            except Exception:
+                pass
+            # Refresh low-level hooks if enabled
+            if self._kbd_available and getattr(self, '_kbd_enabled', False):
+                try:
+                    self._refresh_keyboard_hooks()
+                except Exception:
+                    pass
 
     # --------------------- keyboard package integration -----------------
     def _refresh_keyboard_hooks(self):
@@ -1949,12 +2054,14 @@ class KeyMapperApp(QMainWindow):
                         active_keys.add(sk)
                         break
 
-        # If no keys matched the active title but there are registered
-        # source keys, fall back to creating hooks for those keys. This
-        # ensures the callback exists and avoids uninitialized-local errors
-        # in tests that pre-create _source_index with non-matching buckets.
-        if not active_keys and getattr(self, '_source_index', None):
-            active_keys = set(self._source_index.keys())
+        # If no keys apply to the active window, remove hooks so keys pass
+        # through normally without suppression or re-send delays.
+        if not active_keys:
+            try:
+                self._unhook_all_keyboard_hooks()
+            except Exception:
+                pass
+            return
 
         # Add hooks for newly active keys
         for key in active_keys:
@@ -1967,6 +2074,25 @@ class KeyMapperApp(QMainWindow):
                     # only handle key down
                     if event.event_type != 'down':
                         return
+
+                    # If a macro is running, any real user input should abort it
+                    try:
+                        if getattr(self, '_macro_running', False):
+                            now = time.time()
+                            last_injected = getattr(self, '_last_injected_event_time', 0.0)
+                            grace = getattr(self, '_synthetic_input_grace', 0.25)
+                            # Ignore likely synthetic events within the grace window
+                            if (now - last_injected) <= grace:
+                                return
+                            mt = getattr(self, 'macro_thread', None)
+                            if mt:
+                                try:
+                                    mt.abort_current_macro()
+                                except Exception:
+                                    pass
+                            return
+                    except Exception:
+                        pass
 
                     # periodically clean up expired ignore entries
                     now = time.time()
@@ -2102,6 +2228,17 @@ class KeyMapperApp(QMainWindow):
                     pass
                 del self._keyboard_hooks[k]
 
+        # If the session/desktop has changed and our low-level hooks were
+        # lost, ensure they are reinstalled now by calling _refresh_keyboard_hooks.
+        # (This is a no-op when we are already synchronized.)
+        try:
+            if not self._keyboard_hooks and getattr(self, '_kbd_enabled', False):
+                # Avoid recursive call if _update_hooks_for_active_title is itself
+                # called from _refresh_keyboard_hooks; call only to repair lost hooks
+                self._refresh_keyboard_hooks()
+        except Exception:
+            pass
+
     def _unhook_all_keyboard_hooks(self):
         if not self._kbd_available:
             return
@@ -2112,6 +2249,56 @@ class KeyMapperApp(QMainWindow):
             except Exception:
                 pass
         self._keyboard_hooks.clear()
+
+    def _ensure_input_listeners(self):
+        """
+        Periodically check that keyboard listeners and low-level hooks are active
+        and restart/refresh them if they were lost (e.g. by desktop lock/unlock).
+        """
+        try:
+            # Keyboard thread: ensure it is running, restart if not
+            kthread = getattr(self, 'keyboard_thread', None)
+            if not kthread or not getattr(kthread, 'isRunning', lambda: False)():
+                try:
+                    if kthread:
+                        try:
+                            kthread.stop()
+                        except Exception:
+                            pass
+                    self.keyboard_thread = KeyboardListenerThread(self)
+                    self.keyboard_thread.start()
+                except Exception:
+                    pass
+
+            # Macro thread: ensure it is running
+            try:
+                if hasattr(self, '_ensure_macro_runtime'):
+                    self._ensure_macro_runtime()
+            except Exception:
+                pass
+
+            # Low-level hooks: if they are enabled but lost, try to refresh
+            if self._kbd_available and getattr(self, '_kbd_enabled', False):
+                try:
+                    if not getattr(self, '_keyboard_hooks', None):
+                        self._refresh_keyboard_hooks()
+                    else:
+                        # Proactively refresh hooks for current active title to
+                        # recover from stale/lost hooks without needing a focus change.
+                        try:
+                            with self._active_title_lock:
+                                t = getattr(self, '_cached_active_title', '')
+                        except Exception:
+                            t = getattr(self, '_cached_active_title', '')
+                        try:
+                            self._update_hooks_for_active_title(t)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            # Keep the supervisor resilient to errors
+            pass
 
 
     def closeEvent(self, event):
@@ -2187,6 +2374,16 @@ class KeyMapperApp(QMainWindow):
                     pass
                 try:
                     self._active_watcher.wait(2000)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Stop the listener supervisor when closing
+        try:
+            if getattr(self, '_listener_supervisor', None):
+                try:
+                    self._listener_supervisor.stop()
                 except Exception:
                     pass
         except Exception:
