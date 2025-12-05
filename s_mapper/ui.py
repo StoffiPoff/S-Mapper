@@ -201,6 +201,9 @@ class KeyMapperApp(QMainWindow):
         build_ping_log_tab(self)
         build_macros_tab(self)
 
+        # Diagnostics panel for runtime visibility
+        self._build_diagnostics_panel(main_layout)
+
         # Clipboard is still connected by the main UI (ensure it exists)
         self.clipboard = QApplication.clipboard()
         try:
@@ -269,6 +272,15 @@ class KeyMapperApp(QMainWindow):
         except Exception:
             logging.warning('Failed to setup toolbar/menu')
 
+        # Seed diagnostics state
+        try:
+            self._diag_set_active_title('')
+            self._diag_set_hook_status('Not initialized')
+            self._diag_set_macro_status('Idle')
+            self._diag_set_last_macro_event('')
+        except Exception:
+            pass
+
     def setup_toolbar_and_menu(self):
         # Create a toolbar and a View menu entry to toggle it
         self.toolbar = self.addToolBar("Main Toolbar")
@@ -285,6 +297,79 @@ class KeyMapperApp(QMainWindow):
         self.toggle_toolbar_action.setChecked(True)
         self.toggle_toolbar_action.triggered.connect(self.toggle_toolbar)
         view_menu.addAction(self.toggle_toolbar_action)
+
+    def _build_diagnostics_panel(self, parent_layout):
+        """Create a small diagnostics panel with runtime input status."""
+        from PyQt6.QtWidgets import QFrame, QGridLayout, QLabel, QPushButton
+
+        frame = QFrame()
+        frame.setFrameShape(QFrame.Shape.StyledPanel)
+        grid = QGridLayout(frame)
+        grid.setContentsMargins(6, 6, 6, 6)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(4)
+
+        def _add_row(row, label_text):
+            lbl = QLabel(label_text)
+            val = QLabel("")
+            grid.addWidget(lbl, row, 0)
+            grid.addWidget(val, row, 1)
+            return val
+
+        self._diag_active_title_label = _add_row(0, "Active window:")
+        self._diag_hook_status_label = _add_row(1, "Hook status:")
+        self._diag_macro_status_label = _add_row(2, "Macro thread:")
+        self._diag_last_macro_label = _add_row(3, "Last macro:")
+
+        btn = QPushButton("Restart listeners")
+        btn.clicked.connect(self._restart_listeners)
+        grid.addWidget(btn, 0, 2, 2, 1)
+
+        parent_layout.addWidget(frame)
+
+    def _diag_set_active_title(self, title: str):
+        try:
+            if hasattr(self, '_diag_active_title_label'):
+                self._diag_active_title_label.setText(title or '<none>')
+        except Exception:
+            pass
+
+    def _diag_set_hook_status(self, status: str):
+        try:
+            if hasattr(self, '_diag_hook_status_label'):
+                self._diag_hook_status_label.setText(status)
+        except Exception:
+            pass
+
+    def _diag_set_macro_status(self, status: str):
+        try:
+            if hasattr(self, '_diag_macro_status_label'):
+                self._diag_macro_status_label.setText(status)
+        except Exception:
+            pass
+
+    def _diag_set_last_macro_event(self, msg: str):
+        try:
+            if hasattr(self, '_diag_last_macro_label'):
+                self._diag_last_macro_label.setText(msg)
+        except Exception:
+            pass
+
+    def _restart_listeners(self):
+        """Manual recovery control for hooks/listeners/macro runtime."""
+        try:
+            self._ensure_input_listeners()
+        except Exception:
+            pass
+        try:
+            if self._kbd_available and getattr(self, '_kbd_enabled', False):
+                self._refresh_keyboard_hooks()
+        except Exception:
+            pass
+        try:
+            self._ensure_macro_runtime()
+        except Exception:
+            pass
 
     def toggle_toolbar(self, checked):
         try:
@@ -352,6 +437,11 @@ class KeyMapperApp(QMainWindow):
             old = self._cached_active_title
             self._cached_active_title = tnorm
 
+        try:
+            self._diag_set_active_title(title.strip())
+        except Exception:
+            pass
+
         if tnorm != old and self._kbd_available and getattr(self, '_kbd_enabled', False):
             try:
                 # Update keyboard hooks for the new active title
@@ -371,6 +461,11 @@ class KeyMapperApp(QMainWindow):
                 old = self._cached_active_title
                 self._cached_active_title = tnorm
 
+            try:
+                self._diag_set_active_title(new_title.strip())
+            except Exception:
+                pass
+
             if tnorm != old and self._kbd_available and getattr(self, '_kbd_enabled', False):
                 try:
                     self._update_hooks_for_active_title(tnorm)
@@ -389,13 +484,22 @@ class KeyMapperApp(QMainWindow):
             mt = MacroThread(app=self)
             try:
                 mt.macro_log.connect(lambda s: self.ping_output_view.insertPlainText(s + "\n"))
+                mt.macro_log.connect(lambda s: self._diag_set_last_macro_event(s))
             except Exception:
                 pass
             mt.start()
             self.macro_thread = mt
+            try:
+                self._diag_set_macro_status('Running')
+            except Exception:
+                pass
             return True
         except Exception:
             self.macro_thread = None
+            try:
+                self._diag_set_macro_status('Unavailable')
+            except Exception:
+                pass
             return False
 
     def toggle_ip_monitoring(self, checked):
@@ -1070,6 +1174,10 @@ class KeyMapperApp(QMainWindow):
             try:
                 self.macro_thread.enqueue_macro(macro)
                 QMessageBox.information(self, "Macro queued", f"Macro '{macro.get('name')}' queued for execution.")
+                try:
+                    self._diag_set_last_macro_event(f"Queued: {macro.get('name','')}")
+                except Exception:
+                    pass
             except Exception:
                 QMessageBox.warning(self, "Error", "Failed to queue macro for execution.")
         else:
@@ -1595,6 +1703,10 @@ class KeyMapperApp(QMainWindow):
                                 try:
                                     self.macro_thread.enqueue_macro(macro)
                                     try:
+                                        self._diag_set_last_macro_event(f"Queued: {macro.get('name','')}")
+                                    except Exception:
+                                        pass
+                                    try:
                                         self.ping_output_view.insertPlainText(f"Macro queued: {macro.get('name','<unnamed>')}\n")
                                     except Exception:
                                         pass
@@ -1949,6 +2061,11 @@ class KeyMapperApp(QMainWindow):
         if not self._kbd_available:
             return
 
+        try:
+            self._diag_set_hook_status('Refreshing hooks...')
+        except Exception:
+            pass
+
         # Build a fast lookup: source_key -> list of (window_title, target_key)
         # so callbacks don't need to iterate the entire mapping set each time.
         source_keys = set()
@@ -2034,6 +2151,12 @@ class KeyMapperApp(QMainWindow):
                 self._update_hooks_for_active_title(active_title)
             except Exception:
                 pass
+
+        try:
+            ts = time.strftime('%H:%M:%S')
+            self._diag_set_hook_status(f'Active ({ts})')
+        except Exception:
+            pass
         return
 
     def _update_hooks_for_active_title(self, active_title: str):
@@ -2090,6 +2213,10 @@ class KeyMapperApp(QMainWindow):
                                     mt.abort_current_macro()
                                 except Exception:
                                     pass
+                            try:
+                                self._diag_set_last_macro_event('Aborted: user input')
+                            except Exception:
+                                pass
                             return
                     except Exception:
                         pass
@@ -2236,6 +2363,12 @@ class KeyMapperApp(QMainWindow):
                 # Avoid recursive call if _update_hooks_for_active_title is itself
                 # called from _refresh_keyboard_hooks; call only to repair lost hooks
                 self._refresh_keyboard_hooks()
+        except Exception:
+            pass
+
+        try:
+            ts = time.strftime('%H:%M:%S')
+            self._diag_set_hook_status(f'Active ({ts})')
         except Exception:
             pass
 
